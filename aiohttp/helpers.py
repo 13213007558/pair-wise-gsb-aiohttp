@@ -8,6 +8,7 @@ import datetime
 import enum
 import functools
 import inspect
+import ipaddress
 import netrc
 import os
 import platform
@@ -31,6 +32,7 @@ from typing import (
     Any,
     ContextManager,
     Generic,
+    NamedTuple,
     Protocol,
     TypeVar,
     Union,
@@ -39,7 +41,7 @@ from typing import (
     overload,
 )
 from urllib.parse import quote
-from urllib.request import getproxies, proxy_bypass
+from urllib.request import getproxies
 
 from multidict import CIMultiDict, MultiDict, MultiDictProxy
 from propcache.api import under_cached_property as reify
@@ -280,13 +282,178 @@ def _auth_header_from_netrc(netrc_obj: netrc.netrc | None, host: str) -> str:
     return encode_basic_auth(username, password)
 
 
+_PROXY_ENV_SCHEMES = ("http", "https", "ws", "wss")
+
+# Default ports used to match NO_PROXY tokens carrying an explicit port
+# against URLs without one.
+_DEFAULT_SCHEME_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
+
+
+class _BypassRule(NamedTuple):
+    """A single normalized NO_PROXY token."""
+
+    scheme: str | None
+    port: int | None
+    value: (
+        ipaddress.IPv4Address
+        | ipaddress.IPv6Address
+        | ipaddress.IPv4Network
+        | ipaddress.IPv6Network
+        | str
+    )
+
+
+class ProxyBypassMatcher:
+    """Immutable matcher for a NO_PROXY token list.
+
+    Tokens are normalized to scheme/host/port rules:
+
+    * `*` matches every host.
+    * `example.com` and `.example.com` match the domain itself and
+      all of its subdomains; matching is case-insensitive and ignores a
+      trailing dot on either side.
+    * IPv4/IPv6 literals (`10.0.0.1`, `::1`, `[::1]`) match the
+      same address only.
+    * CIDR ranges (`10.0.0.0/8`, `fd00::/8`) match addresses inside
+      the network.
+    * A `:port` suffix (`example.com:8080`, `[::1]:8080`) restricts
+      the rule to that port; URLs without an explicit port match against
+      the default port of their scheme.
+    * A `scheme://` prefix (`http://example.com`) restricts the rule
+      to that URL scheme.
+    """
+
+    __slots__ = ("_match_all", "_rules")
+
+    def __init__(self, rules: tuple[_BypassRule, ...], match_all: bool) -> None:
+        self._rules = rules
+        self._match_all = match_all
+
+    @classmethod
+    def from_string(cls, no_proxy: str) -> "ProxyBypassMatcher":
+        """Build a matcher from a comma-separated NO_PROXY value."""
+        rules = []
+        match_all = False
+        for token in no_proxy.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if token == "*":
+                match_all = True
+                continue
+            rule = cls._parse_token(token)
+            if rule is not None:
+                rules.append(rule)
+        return cls(tuple(rules), match_all)
+
+    @staticmethod
+    def _parse_token(token: str) -> _BypassRule | None:
+        scheme: str | None = None
+        if "://" in token:
+            scheme, _, token = token.partition("://")
+            scheme = scheme.lower()
+            if not token:
+                return None
+
+        port: int | None = None
+        host = token
+        if token.startswith("["):
+            # [IPv6] or [IPv6]:port
+            end = token.find("]")
+            if end == -1:
+                return None
+            host = token[1:end]
+            rest = token[end + 1 :]
+            if rest:
+                if not rest.startswith(":") or not rest[1:].isdigit():
+                    return None
+                port = int(rest[1:])
+        elif token.count(":") == 1:
+            host_part, _, port_part = token.rpartition(":")
+            if port_part:
+                if not port_part.isdigit():
+                    return None
+                port = int(port_part)
+            host = host_part
+        # Anything else with multiple colons is treated as a bare IPv6
+        # literal (or CIDR range) without a port.
+
+        host = host.strip().lower().rstrip(".")
+        if not host:
+            return None
+
+        if "/" in host:
+            try:
+                network = ipaddress.ip_network(host, strict=False)
+            except ValueError:
+                # Tolerate a trailing path (e.g. "example.com/").
+                host = host.split("/", 1)[0]
+                if not host:
+                    return None
+            else:
+                return _BypassRule(scheme, port, network)
+
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            pass
+        else:
+            return _BypassRule(scheme, port, ip)
+
+        domain = host.lstrip(".")
+        if domain.startswith("*."):
+            domain = domain[2:]
+        if not domain:
+            return None
+        return _BypassRule(scheme, port, domain)
+
+    def matches(self, scheme: str, host: str, port: int | None) -> bool:
+        """Return True if the request target bypasses the proxy."""
+        if self._match_all:
+            return True
+        host = host.lower().rstrip(".")
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        if not host:
+            return False
+        host_ip: ipaddress.IPv4Address | ipaddress.IPv6Address | None
+        try:
+            host_ip = ipaddress.ip_address(host)
+        except ValueError:
+            host_ip = None
+        for rule in self._rules:
+            if rule.scheme is not None and rule.scheme != scheme:
+                continue
+            if rule.port is not None and rule.port != port:
+                continue
+            value = rule.value
+            if isinstance(value, str):
+                if host == value or host.endswith("." + value):
+                    return True
+            elif isinstance(value, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
+                if host_ip is not None and host_ip in value:
+                    return True
+            elif host_ip is not None and host_ip == value:
+                return True
+        return False
+
+    def matches_url(self, url: URL) -> bool:
+        """Return True if the URL bypasses the proxy."""
+        host = url.host
+        if host is None:
+            return False
+        port = url.explicit_port or _DEFAULT_SCHEME_PORTS.get(url.scheme)
+        return self.matches(url.scheme, host, port)
+
+
 def proxies_from_env() -> dict[str, ProxyInfo]:
-    proxy_urls = {
-        k: URL(v)
-        for k, v in getproxies().items()
-        if k in ("http", "https", "ws", "wss")
-    }
-    netrc_obj = netrc_from_env()
+    return _parse_env_proxies(getproxies())
+
+
+def _parse_env_proxies(proxy_env: Mapping[str, str]) -> dict[str, ProxyInfo]:
+    proxy_urls = {k: URL(v) for k, v in proxy_env.items() if k in _PROXY_ENV_SCHEMES}
+    netrc_obj: netrc.netrc | None = None
+    netrc_loaded = False
     stripped = {k: strip_auth_from_url(v) for k, v in proxy_urls.items()}
     ret = {}
     for proto, val in stripped.items():
@@ -296,8 +463,13 @@ def proxies_from_env() -> dict[str, ProxyInfo]:
                 "%s proxies %s are not supported, ignoring", proxy.scheme.upper(), proxy
             )
             continue
-        if netrc_obj and auth is None:
-            if proxy.host is not None:
+        if auth is None and proxy.host is not None:
+            if not netrc_loaded:
+                # Load netrc lazily so sessions without proxies never
+                # touch the file system.
+                netrc_obj = netrc_from_env()
+                netrc_loaded = True
+            if netrc_obj is not None:
                 try:
                     auth = _auth_header_from_netrc(netrc_obj, proxy.host)
                 except LookupError:
@@ -306,18 +478,47 @@ def proxies_from_env() -> dict[str, ProxyInfo]:
     return ret
 
 
+@frozen_dataclass_decorator
+class EnvProxySettings:
+    """An immutable snapshot of the proxy configuration from the environment.
+
+    A snapshot is taken when a :class:`aiohttp.ClientSession` with
+    ``trust_env=True`` is created; routing decisions then stay
+    consistent for the session's lifetime, are unaffected by later
+    environment changes, and are never shared with other sessions.
+    """
+
+    proxies: Mapping[str, ProxyInfo]
+    no_proxy: ProxyBypassMatcher
+
+    @classmethod
+    def from_environ(cls) -> "EnvProxySettings":
+        """Snapshot the proxy configuration from the process environment."""
+        proxy_env = getproxies()
+        return cls(
+            proxies=MappingProxyType(_parse_env_proxies(proxy_env)),
+            no_proxy=ProxyBypassMatcher.from_string(proxy_env.get("no", "")),
+        )
+
+    def proxy_for(self, url: URL) -> tuple[URL, str | None]:
+        """Return the proxy and its auth header for *url*.
+
+        :raises LookupError: if the URL bypasses proxies or no proxy is
+                configured for its scheme.
+        """
+        if url.host is not None and self.no_proxy.matches_url(url):
+            raise LookupError(f"Proxying is disallowed for `{url.host!r}`")
+        try:
+            proxy_info = self.proxies[url.scheme]
+        except KeyError:
+            raise LookupError(f"No proxies found for `{url!s}` in the env")
+        else:
+            return proxy_info.proxy, proxy_info.proxy_auth
+
+
 def get_env_proxy_for_url(url: URL) -> tuple[URL, str | None]:
     """Get a permitted proxy for the given URL from the env."""
-    if url.host is not None and proxy_bypass(url.host):
-        raise LookupError(f"Proxying is disallowed for `{url.host!r}`")
-
-    proxies_in_env = proxies_from_env()
-    try:
-        proxy_info = proxies_in_env[url.scheme]
-    except KeyError:
-        raise LookupError(f"No proxies found for `{url!s}` in the env")
-    else:
-        return proxy_info.proxy, proxy_info.proxy_auth
+    return EnvProxySettings.from_environ().proxy_for(url)
 
 
 @frozen_dataclass_decorator

@@ -1,0 +1,15 @@
+Unified client proxy routing behind a single decision point: the proxy
+environment is now snapshotted once when a :class:`~aiohttp.ClientSession`
+with ``trust_env=True`` is created, so concurrent sessions never share
+mutable proxy state and later environment changes cannot reroute an
+existing session.
+
+``NO_PROXY`` tokens are now normalized to scheme/host/port rules with
+support for IPv4/IPv6 literals, CIDR ranges, leading-dot domains and
+port-qualified tokens, instead of delegating to
+:func:`urllib.request.proxy_bypass`. A per-request ``proxy`` argument
+always overrides the environment without inheriting its credentials,
+environment proxy credentials are re-resolved on every redirect hop, and
+Unix socket / named pipe connectors always connect directly.
+
+-- by :user:`TODO-github-handle`

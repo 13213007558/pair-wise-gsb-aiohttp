@@ -755,7 +755,30 @@ constructor.::
     aiohttp uses :func:`urllib.request.getproxies`
     for reading the proxy configuration (e.g. from the *HTTP_PROXY* etc. environment variables) and applies them for the *HTTP*, *HTTPS*, *WS* and *WSS* schemes.
 
-    Hosts defined in ``no_proxy`` will bypass the proxy.
+    The configuration is snapshotted once, when the
+    :class:`aiohttp.ClientSession` is created: later changes to the
+    environment do not affect an existing session, and sessions never
+    share proxy state with each other.
+
+    Hosts defined in ``no_proxy`` will bypass the proxy. Each
+    comma-separated token is normalized to a scheme/host/port rule:
+
+    * ``*`` bypasses the proxy for every host.
+    * ``example.com`` and ``.example.com`` match the domain itself and
+      all of its subdomains (case-insensitively, ignoring trailing dots).
+    * IPv4/IPv6 literals (``10.0.0.1``, ``::1``, ``[::1]``) match the
+      same address only.
+    * CIDR ranges (``10.0.0.0/8``, ``fd00::/8``) match any address
+      inside the network.
+    * A ``:port`` suffix (``example.com:8080``, ``[::1]:8080``) restricts
+      the rule to that port; URLs without an explicit port are matched
+      against the default port of their scheme.
+    * A ``scheme://`` prefix (``http://example.com``) restricts the rule
+      to that URL scheme.
+
+    A per-request *proxy* argument always overrides the environment, and
+    proxy credentials from the environment are never attached to it.
+    Unix socket and named pipe connectors always connect directly.
 
 Proxy credentials are given from ``~/.netrc`` file if present (see
 :class:`aiohttp.ClientSession` for more details).

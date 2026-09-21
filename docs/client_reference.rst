@@ -190,6 +190,9 @@ The client session supports the context manager protocol for self closing.
       is ``True`` (``False`` by default). See :ref:`aiohttp-client-proxy-support` for
       more information.
 
+      The proxy configuration is read once, when the session is created;
+      later environment changes do not affect the session.
+
       Get proxy credentials from ``~/.netrc`` file if present.
 
       Get HTTP Basic Auth credentials from :file:`~/.netrc` file if present.

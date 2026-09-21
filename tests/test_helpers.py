@@ -778,6 +778,129 @@ def test_get_env_proxy_for_url(proxy_env_vars: dict[str, str], url_input: str) -
     assert proxy_auth is None
 
 
+# --------------------- ProxyBypassMatcher ------------------------------
+
+
+@pytest.mark.parametrize(
+    ("no_proxy", "url_input", "expected"),
+    (
+        # IPv4 literal.
+        ("10.0.0.1", "http://10.0.0.1/", True),
+        ("10.0.0.1", "http://10.0.0.2/", False),
+        # IPv6 literal, bare and bracketed.
+        ("::1", "http://[::1]/", True),
+        ("[::1]", "http://[::1]/", True),
+        ("::1", "http://[::2]/", False),
+        # CIDR ranges; an IPv6 range never matches IPv4 and vice versa.
+        ("10.0.0.0/8", "http://10.1.2.3/", True),
+        ("10.0.0.0/8", "http://11.0.0.1/", False),
+        ("fd00::/8", "http://[fd00::1]/", True),
+        ("fd00::/8", "http://10.0.0.1/", False),
+        ("10.0.0.0/8", "http://example.com/", False),
+        # Plain and leading-dot domains match the domain and subdomains.
+        ("example.com", "http://example.com/", True),
+        ("example.com", "http://www.example.com/", True),
+        (".example.com", "http://example.com/", True),
+        (".example.com", "http://www.example.com/", True),
+        ("*.example.com", "http://www.example.com/", True),
+        # ... but never a different suffix.
+        ("example.com", "http://notexample.com/", False),
+        ("example.com", "http://example.com.evil.org/", False),
+        # Trailing dots are normalized away on both sides.
+        ("example.com.", "http://example.com/", True),
+        ("example.com", "http://example.com./", True),
+        # Matching is case-insensitive.
+        ("EXAMPLE.com", "http://WWW.EXAMPLE.COM/", True),
+        # A token path is tolerated and ignored.
+        ("example.com/path", "http://example.com/", True),
+        # Port-qualified tokens only match that port; URLs without an
+        # explicit port match against the scheme default.
+        ("example.com:8080", "http://example.com:8080/", True),
+        ("example.com:8080", "http://example.com:8081/", False),
+        ("example.com:8080", "http://example.com/", False),
+        ("example.com:80", "http://example.com/", True),
+        ("example.com:443", "https://example.com/", True),
+        ("[::1]:8080", "http://[::1]:8080/", True),
+        ("[::1]:8080", "http://[::1]:9090/", False),
+        ("10.0.0.0/8:8080", "http://10.1.2.3:8080/", True),
+        ("10.0.0.0/8:8080", "http://10.1.2.3:9090/", False),
+        # Scheme-qualified tokens only apply to that scheme.
+        ("http://example.com", "http://example.com/", True),
+        ("http://example.com", "https://example.com/", False),
+        # A bare star bypasses everything.
+        ("*", "http://anything.example/", True),
+        # Token lists are comma-separated and tolerate whitespace.
+        ("foo.org, example.com ,,bar.net", "http://example.com/", True),
+        ("foo.org, example.com ,,bar.net", "http://baz.org/", False),
+        # Invalid tokens never match but do not break the valid ones.
+        ("example.com:abc,ok.org", "http://example.com/", False),
+        ("example.com:abc,ok.org", "http://ok.org/", True),
+        ("[::1,ok.org", "http://[::1]/", False),
+        ("[::1,ok.org", "http://ok.org/", True),
+    ),
+)
+def test_proxy_bypass_matcher(no_proxy: str, url_input: str, expected: bool) -> None:
+    matcher = helpers.ProxyBypassMatcher.from_string(no_proxy)
+    assert matcher.matches_url(URL(url_input)) is expected
+
+
+def test_proxy_bypass_matcher_empty() -> None:
+    matcher = helpers.ProxyBypassMatcher.from_string("")
+    assert not matcher.matches_url(URL("http://example.com/"))
+
+
+# --------------------- EnvProxySettings ------------------------------
+
+
+@pytest.fixture
+def hermetic_getproxies(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    """Patch helpers.getproxies with a test-controlled mapping."""
+    proxy_env: dict[str, str] = {}
+    monkeypatch.setattr(helpers, "getproxies", lambda: dict(proxy_env))
+    return proxy_env
+
+
+def test_env_proxy_settings_snapshot_is_immutable(
+    hermetic_getproxies: dict[str, str],
+) -> None:
+    hermetic_getproxies["http"] = "http://proxy-a.example"
+    settings = helpers.EnvProxySettings.from_environ()
+    hermetic_getproxies["http"] = "http://proxy-b.example"
+    hermetic_getproxies["no"] = "example.com"
+
+    # Later environment changes do not affect the snapshot...
+    proxy, proxy_auth = settings.proxy_for(URL("http://example.com/"))
+    assert proxy == URL("http://proxy-a.example")
+    assert proxy_auth is None
+    # ... and the snapshot cannot be mutated either.
+    assert isinstance(settings.proxies, MappingProxyType)
+    with pytest.raises(TypeError):
+        settings.proxies["http"] = settings.proxies["http"]  # type: ignore[index]
+
+
+def test_env_proxy_settings_no_proxy_from_env(
+    hermetic_getproxies: dict[str, str],
+) -> None:
+    hermetic_getproxies["http"] = "http://proxy.example"
+    hermetic_getproxies["no"] = "10.0.0.0/8,.example.com"
+    settings = helpers.EnvProxySettings.from_environ()
+
+    with pytest.raises(LookupError, match="Proxying is disallowed"):
+        settings.proxy_for(URL("http://10.1.2.3/"))
+    with pytest.raises(LookupError, match="Proxying is disallowed"):
+        settings.proxy_for(URL("http://www.example.com/"))
+    proxy, _ = settings.proxy_for(URL("http://other.org/"))
+    assert proxy == URL("http://proxy.example")
+
+
+def test_env_proxy_settings_no_proxies(
+    hermetic_getproxies: dict[str, str],
+) -> None:
+    settings = helpers.EnvProxySettings.from_environ()
+    with pytest.raises(LookupError, match="No proxies found"):
+        settings.proxy_for(URL("http://example.com/"))
+
+
 # ------------- set_result / set_exception ----------------------
 
 

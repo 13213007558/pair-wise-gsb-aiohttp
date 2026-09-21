@@ -90,9 +90,9 @@ from .helpers import (
     DEFAULT_CHUNK_SIZE,
     EMPTY_BODY_METHODS,
     HTTP_AND_EMPTY_SCHEMA_SET,
+    EnvProxySettings,
     TimeoutHandle,
     _auth_header_from_netrc,
-    get_env_proxy_for_url,
     netrc_from_env,
     sentinel,
     strip_auth_from_url,
@@ -274,6 +274,7 @@ class ClientSession:
         "_raise_for_status",
         "_auto_decompress",
         "_trust_env",
+        "_env_proxy_settings",
         "_default_headers",
         "_skip_auto_headers",
         "_request_class",
@@ -390,6 +391,12 @@ class ClientSession:
         self._raise_for_status = raise_for_status
         self._auto_decompress = auto_decompress
         self._trust_env = trust_env
+        # Snapshot the proxy environment once, at session creation: routing
+        # decisions stay consistent for the session's lifetime and are
+        # unaffected by later environment changes or other sessions.
+        self._env_proxy_settings = (
+            EnvProxySettings.from_environ() if trust_env else None
+        )
         self._requote_redirect_url = requote_redirect_url
         self._read_bufsize = read_bufsize
         self._max_line_size = max_line_size
@@ -659,13 +666,16 @@ class ClientSession:
                     proxy_: URL | None = None
                     if proxy is not None:
                         proxy_ = URL(proxy)
-                    elif self._trust_env:
+                    elif (
+                        self._env_proxy_settings is not None
+                        and self._connector.proxy_supported
+                    ):
                         # Re-resolve per iteration; drop stale env-proxy auth so
                         # a redirect that switches proxies can't leak credentials.
                         resolved_proxy_headers = None
                         with suppress(LookupError):
-                            proxy_, env_proxy_auth = await asyncio.to_thread(
-                                get_env_proxy_for_url, url
+                            proxy_, env_proxy_auth = self._env_proxy_settings.proxy_for(
+                                url
                             )
                             if env_proxy_auth is not None:
                                 resolved_proxy_headers = CIMultiDict(

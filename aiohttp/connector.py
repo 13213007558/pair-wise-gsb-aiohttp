@@ -323,6 +323,11 @@ class BaseConnector:
     # abort transport after 2 seconds (cleanup broken connections)
     _cleanup_closed_period = 2.0
 
+    #: Whether requests may be routed through a proxy by this connector.
+    #: Connectors that dial a fixed local endpoint (Unix sockets, named
+    #: pipes) never use a proxy.
+    proxy_supported = True
+
     allowed_protocol_schema_set = HIGH_LEVEL_SCHEMA_SET
 
     def __init__(
@@ -1685,6 +1690,8 @@ class UnixConnector(BaseConnector):
     loop - Optional event loop.
     """
 
+    proxy_supported = False
+
     allowed_protocol_schema_set = HIGH_LEVEL_SCHEMA_SET | frozenset({"unix"})
 
     def __init__(
@@ -1740,6 +1747,8 @@ class NamedPipeConnector(BaseConnector):
     limit_per_host - Number of simultaneous connections to one host.
     loop - Optional event loop.
     """
+
+    proxy_supported = False
 
     allowed_protocol_schema_set = HIGH_LEVEL_SCHEMA_SET | frozenset({"npipe"})
 

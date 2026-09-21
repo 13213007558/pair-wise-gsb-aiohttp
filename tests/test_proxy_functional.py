@@ -2,6 +2,7 @@ import asyncio
 import os
 import pathlib
 import platform
+import socket
 import ssl
 import sys
 from collections.abc import Awaitable, Callable, Iterator
@@ -19,6 +20,7 @@ from yarl import URL
 
 import aiohttp
 from aiohttp import ClientResponse, web
+from aiohttp.abc import AbstractResolver, ResolveResult
 from aiohttp.client import _RequestOptions
 from aiohttp.client_exceptions import ClientConnectionError
 from aiohttp.test_utils import TestServer
@@ -1058,3 +1060,218 @@ async def test_https_proxy_connect_tunnel_session_close_no_hang(
     finally:
         # Clean close
         await session.close()
+
+
+class FakeResolver(AbstractResolver):
+    """Resolver that maps every host to loopback and records lookups."""
+
+    def __init__(self) -> None:
+        self.hosts: list[str] = []
+
+    async def resolve(
+        self,
+        host: str,
+        port: int = 0,
+        family: socket.AddressFamily = socket.AF_INET,
+    ) -> list[ResolveResult]:
+        self.hosts.append(host)
+        return [
+            {
+                "hostname": host,
+                "host": "127.0.0.1",
+                "port": port,
+                "family": socket.AF_INET,
+                "proto": 0,
+                "flags": 0,
+            }
+        ]
+
+    async def close(self) -> None:
+        pass
+
+
+@pytest.fixture
+def clean_proxy_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> pytest.MonkeyPatch:
+    """Isolate the process from ambient proxy configuration."""
+    for name in (
+        "http_proxy",
+        "https_proxy",
+        "ws_proxy",
+        "wss_proxy",
+        "all_proxy",
+        "no_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "WS_PROXY",
+        "WSS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    netrc_file = tmp_path / "empty_netrc"
+    netrc_file.write_text("")
+    monkeypatch.setenv("NETRC", str(netrc_file))
+    return monkeypatch
+
+
+@pytest.mark.parametrize(
+    "no_proxy_template",
+    ("{host}", ".example", "{host}:{port}", "*"),
+    ids=("domain", "leading-dot-domain", "domain-with-port", "star"),
+)
+async def test_proxy_from_env_bypassed_by_no_proxy(
+    proxy_test_server: Callable[[], Awaitable[mock.Mock]],
+    aiohttp_raw_server: AiohttpRawServer,
+    clean_proxy_env: pytest.MonkeyPatch,
+    no_proxy_template: str,
+) -> None:
+    received: list[web.Request] = []
+
+    async def handler(request: web.Request) -> web.Response:
+        received.append(request)
+        return web.Response(text="ok")
+
+    target = await aiohttp_raw_server(handler)
+    proxy = await proxy_test_server()
+    resolver = FakeResolver()
+    no_proxy = no_proxy_template.format(host="bypassed.example", port=target.port)
+    clean_proxy_env.setenv("http_proxy", str(proxy.url))
+    clean_proxy_env.setenv("no_proxy", no_proxy)
+
+    connector = aiohttp.TCPConnector(resolver=resolver, ssl=False)
+    async with aiohttp.ClientSession(connector=connector, trust_env=True) as sess:
+        async with sess.get(f"http://bypassed.example:{target.port}/path") as resp:
+            assert resp.status == 200
+
+    # The request went direct: the recording proxy saw nothing, the fake
+    # resolver was consulted for the target host, and no proxy credentials
+    # were attached.
+    assert proxy.requests_list == []
+    assert resolver.hosts == ["bypassed.example"]
+    assert len(received) == 1
+    assert "Proxy-Authorization" not in received[0].headers
+
+
+async def test_proxy_from_env_not_bypassed(
+    proxy_test_server: Callable[[], Awaitable[mock.Mock]],
+    clean_proxy_env: pytest.MonkeyPatch,
+) -> None:
+    proxy = await proxy_test_server()
+    resolver = FakeResolver()
+    clean_proxy_env.setenv("http_proxy", str(proxy.url))
+    clean_proxy_env.setenv("no_proxy", "other.example")
+
+    connector = aiohttp.TCPConnector(resolver=resolver, ssl=False)
+    async with aiohttp.ClientSession(connector=connector, trust_env=True) as sess:
+        async with sess.get("http://proxied.example:8080/path") as resp:
+            assert resp.status == 200
+
+    # The request went through the proxy; the target host is resolved
+    # remotely, so the local resolver was never consulted for it.
+    assert len(proxy.requests_list) == 1
+    assert proxy.request.host == "proxied.example:8080"
+    assert proxy.request.path_qs == "/path"
+    assert "bypassed.example" not in resolver.hosts
+    assert "proxied.example" not in resolver.hosts
+
+
+async def test_proxy_from_env_snapshot_at_session_creation(
+    proxy_test_server: Callable[[], Awaitable[mock.Mock]],
+    clean_proxy_env: pytest.MonkeyPatch,
+) -> None:
+    proxy_a = await proxy_test_server()
+    proxy_b = await proxy_test_server()
+    clean_proxy_env.setenv("http_proxy", str(proxy_a.url))
+
+    connector = aiohttp.TCPConnector(ssl=False)
+    async with aiohttp.ClientSession(connector=connector, trust_env=True) as sess:
+        # The environment changes after the session snapshot was taken.
+        clean_proxy_env.setenv("http_proxy", str(proxy_b.url))
+        async with sess.get("http://aiohttp.io/path") as resp:
+            assert resp.status == 200
+
+    assert len(proxy_a.requests_list) == 1
+    assert proxy_b.requests_list == []
+
+
+async def test_proxy_from_env_per_request_proxy_overrides(
+    proxy_test_server: Callable[[], Awaitable[mock.Mock]],
+    clean_proxy_env: pytest.MonkeyPatch,
+) -> None:
+    env_proxy = await proxy_test_server()
+    explicit_proxy = await proxy_test_server()
+    clean_proxy_env.setenv(
+        "http_proxy", str(env_proxy.url.with_user("user").with_password("pass"))
+    )
+
+    connector = aiohttp.TCPConnector(ssl=False)
+    async with aiohttp.ClientSession(connector=connector, trust_env=True) as sess:
+        async with sess.get(
+            "http://aiohttp.io/path", proxy=str(explicit_proxy.url)
+        ) as resp:
+            assert resp.status == 200
+
+    assert env_proxy.requests_list == []
+    assert len(explicit_proxy.requests_list) == 1
+    # The env proxy's credentials must not leak onto the explicit proxy.
+    assert "Proxy-Authorization" not in explicit_proxy.request.headers
+
+
+async def test_proxy_from_env_session_default_proxy_overrides(
+    proxy_test_server: Callable[[], Awaitable[mock.Mock]],
+    clean_proxy_env: pytest.MonkeyPatch,
+) -> None:
+    env_proxy = await proxy_test_server()
+    default_proxy = await proxy_test_server()
+    clean_proxy_env.setenv("http_proxy", str(env_proxy.url))
+
+    connector = aiohttp.TCPConnector(ssl=False)
+    async with aiohttp.ClientSession(
+        connector=connector, trust_env=True, proxy=str(default_proxy.url)
+    ) as sess:
+        async with sess.get("http://aiohttp.io/path") as resp:
+            assert resp.status == 200
+
+    assert env_proxy.requests_list == []
+    assert len(default_proxy.requests_list) == 1
+
+
+async def test_proxy_from_env_redirect_to_bypassed_host_drops_auth(
+    proxy_test_server: Callable[[], Awaitable[mock.Mock]],
+    aiohttp_raw_server: AiohttpRawServer,
+    clean_proxy_env: pytest.MonkeyPatch,
+) -> None:
+    received: list[CIMultiDict[str]] = []
+
+    async def handler(request: web.Request) -> web.Response:
+        received.append(CIMultiDict(request.headers))
+        return web.Response(text="ok")
+
+    target = await aiohttp_raw_server(handler)
+    proxy = await proxy_test_server()
+    proxy.return_value = {
+        "status": 302,
+        "headers": {"Location": f"http://bypassed.example:{target.port}/"},
+    }
+    resolver = FakeResolver()
+    clean_proxy_env.setenv(
+        "http_proxy", str(proxy.url.with_user("user").with_password("pass"))
+    )
+    clean_proxy_env.setenv("no_proxy", "bypassed.example")
+
+    connector = aiohttp.TCPConnector(resolver=resolver, ssl=False)
+    async with aiohttp.ClientSession(connector=connector, trust_env=True) as sess:
+        async with sess.get("http://proxied.example/redirect") as resp:
+            assert resp.status == 200
+
+    # The first hop went through the authenticated proxy...
+    assert len(proxy.requests_list) == 1
+    expected_header = aiohttp.encode_basic_auth("user", "pass")
+    assert proxy.request.headers["Proxy-Authorization"] == expected_header
+    # ... while the bypassed redirect target was reached directly and
+    # never saw the proxy credentials.
+    assert resolver.hosts == ["bypassed.example"]
+    assert len(received) == 1
+    assert "Proxy-Authorization" not in received[0]
