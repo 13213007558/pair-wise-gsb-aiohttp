@@ -1011,6 +1011,113 @@ async def test_tcp_connector_happy_eyeballs(
     await conn.close()
 
 
+async def test_tcp_connector_happy_eyeballs_loser_closed(
+    make_client_request: _RequestMaker,
+) -> None:
+    """The loser of the happy eyeballs race is cancelled and closed.
+
+    Only the winning address may leave an active transport behind,
+    and the loser must not overwrite the successful result.
+    """
+    loop = asyncio.get_running_loop()
+    ip1 = "192.168.1.1"  # loser: connect never completes
+    ip2 = "192.168.1.2"  # winner: connects immediately
+    ips = [ip1, ip2]
+
+    created_sockets: list[socket.socket] = []
+
+    def socket_factory(addr_info: AddrInfoType) -> socket.socket:
+        family, type_, proto, _, _ = addr_info
+        sock = socket.socket(family=family, type=type_, proto=proto)
+        created_sockets.append(sock)
+        return sock
+
+    conn = aiohttp.TCPConnector(
+        happy_eyeballs_delay=0.01, socket_factory=socket_factory
+    )
+
+    addrs_tried: list[Any] = []
+
+    async def sock_connect(*args: Any, **kwargs: Any) -> None:
+        addr = args[1]
+        addrs_tried.append(addr)
+        if addr[0] == ip1:
+            # The loser hangs until it is cancelled
+            await asyncio.sleep(3600)
+
+    async def create_connection(
+        *args: object, sock: socket.socket | None = None, **kwargs: object
+    ) -> tuple[ResponseHandler, ResponseHandler]:
+        assert isinstance(sock, socket.socket)
+        # Close the socket since we are not actually connecting
+        # and we don't want to leak it.
+        sock.close()
+        tr = create_mocked_conn(loop)
+        pr = create_mocked_conn(loop, should_close=False)
+        return tr, pr
+
+    req = make_client_request("GET", URL("http://mocked.host"), loop=loop)
+
+    async def _resolve_host(
+        host: str, port: int, traces: object = None
+    ) -> list[ResolveResult]:
+        return [
+            {
+                "hostname": host,
+                "host": ip,
+                "port": port,
+                "family": socket.AF_INET,
+                "proto": 0,
+                "flags": socket.AI_NUMERICHOST,
+            }
+            for ip in ips
+        ]
+
+    with (
+        mock.patch.object(
+            conn,
+            "_resolve_host",
+            autospec=True,
+            spec_set=True,
+            side_effect=_resolve_host,
+        ),
+        mock.patch.object(
+            conn._loop,
+            "sock_connect",
+            autospec=True,
+            spec_set=True,
+            side_effect=sock_connect,
+        ),
+        mock.patch.object(
+            connector_module,
+            "create_connection",
+            autospec=True,
+            spec_set=True,
+            side_effect=create_connection,
+        ),
+    ):
+        established_connection = await conn.connect(req, [], ClientTimeout())
+
+        # Both addresses were attempted, the loser first
+        assert addrs_tried == [(ip1, 80), (ip2, 80)]
+
+        # The winner leaves exactly one active transport behind
+        assert len(conn._acquired) == 1
+
+        # Two sockets were opened for the race and both are closed:
+        # the loser was cancelled and closed, the winner was closed
+        # by the mocked create_connection above.
+        assert len(created_sockets) == 2
+        assert all(sock.fileno() == -1 for sock in created_sockets)
+
+        # Releasing returns exactly one connection to the pool
+        established_connection.release()
+        assert len(conn._acquired) == 0
+        assert sum(len(conns) for conns in conn._conns.values()) == 1
+
+    await conn.close()
+
+
 @pytest.mark.skipif(not HAS_IPV6, reason="IPv6 is not available")
 async def test_tcp_connector_interleave(make_client_request: _RequestMaker) -> None:
     loop = asyncio.get_running_loop()
@@ -1430,6 +1537,84 @@ async def test_tcp_connector_use_dns_cache_disabled(
         )
 
         await conn.close()
+
+
+async def test_tcp_connector_dns_cache_property() -> None:
+    async with aiohttp.TCPConnector(use_dns_cache=True) as conn:
+        assert conn.dns_cache is True
+    async with aiohttp.TCPConnector(use_dns_cache=False) as conn:
+        assert conn.dns_cache is False
+
+
+async def test_tcp_connector_cached_hosts_property() -> None:
+    hosts: list[ResolveResult] = [
+        {
+            "hostname": "localhost",
+            "host": "127.0.0.1",
+            "port": 8080,
+            "family": socket.AF_INET,
+            "proto": 0,
+            "flags": socket.AI_NUMERICHOST,
+        }
+    ]
+    with mock.patch("aiohttp.connector.DefaultResolver") as m_resolver:
+        mock_default_resolver = mock.create_autospec(
+            AsyncResolver, instance=True, spec_set=True
+        )
+        mock_default_resolver.resolve.return_value = hosts
+        m_resolver.return_value = mock_default_resolver
+
+        async with aiohttp.TCPConnector(use_dns_cache=True, ttl_dns_cache=10) as conn:
+            # Nothing resolved yet
+            assert conn.cached_hosts == {}
+
+            await conn._resolve_host("localhost", 8080)
+
+            cached = conn.cached_hosts
+            assert list(cached) == [("localhost", 8080)]
+            assert cached[("localhost", 8080)] == hosts
+            # The mapping is a read-only snapshot
+            with pytest.raises(TypeError):
+                cached[("localhost", 8080)] = hosts  # type: ignore[index]
+
+        async with aiohttp.TCPConnector(use_dns_cache=False) as conn:
+            assert conn.dns_cache is False
+            assert conn.cached_hosts == {}
+
+
+async def test_tcp_connector_cached_hosts_round_robin_undisturbed() -> None:
+    """Reading cached_hosts must not consume the round-robin state."""
+    hosts: list[ResolveResult] = [
+        {
+            "hostname": "localhost",
+            "host": f"127.0.0.{i}",
+            "port": 8080,
+            "family": socket.AF_INET,
+            "proto": 0,
+            "flags": socket.AI_NUMERICHOST,
+        }
+        for i in (1, 2)
+    ]
+    with mock.patch("aiohttp.connector.DefaultResolver") as m_resolver:
+        mock_default_resolver = mock.create_autospec(
+            AsyncResolver, instance=True, spec_set=True
+        )
+        mock_default_resolver.resolve.return_value = hosts
+        m_resolver.return_value = mock_default_resolver
+
+        async with aiohttp.TCPConnector(use_dns_cache=True, ttl_dns_cache=10) as conn:
+            first = await conn._resolve_host("localhost", 8080)
+            assert first == hosts
+            # The snapshot reflects the upcoming rotation without
+            # consuming it.
+            snapshot = conn.cached_hosts[("localhost", 8080)]
+            second = await conn._resolve_host("localhost", 8080)
+            assert snapshot == second
+            assert second == [hosts[1], hosts[0]]
+            # Only one DNS lookup happened for both resolves
+            mock_default_resolver.resolve.assert_called_once_with(
+                "localhost", 8080, family=0
+            )
 
 
 async def test_tcp_connector_dns_throttle_requests(

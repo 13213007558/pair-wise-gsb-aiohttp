@@ -10,9 +10,9 @@ from collections import OrderedDict, defaultdict, deque
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import suppress
 from http import HTTPStatus
-from itertools import chain, cycle, islice
+from itertools import chain, cycle, islice, tee
 from time import monotonic
-from types import TracebackType
+from types import MappingProxyType, TracebackType
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import aiohappyeyeballs
@@ -905,6 +905,20 @@ class _DNSCacheTable:
         self._addrs_rr.clear()
         self._timestamps.clear()
 
+    def snapshot(self) -> dict[tuple[str, int], list[ResolveResult]]:
+        """Return a snapshot of the cached addresses.
+
+        The round-robin state of the cache is left untouched, so the
+        snapshot for a key matches what the next next_addrs() call
+        for that key would return.
+        """
+        result: dict[tuple[str, int], list[ResolveResult]] = {}
+        for key, (loop, length) in self._addrs_rr.items():
+            loop, peek = tee(loop)
+            self._addrs_rr[key] = (loop, length)
+            result[key] = list(islice(peek, length))
+        return result
+
     def next_addrs(self, key: tuple[str, int]) -> list[ResolveResult]:
         loop, length = self._addrs_rr[key]
         addrs = list(islice(loop, length))
@@ -1110,6 +1124,20 @@ class TCPConnector(BaseConnector):
     def use_dns_cache(self) -> bool:
         """True if local DNS caching is enabled."""
         return self._use_dns_cache
+
+    @property
+    def dns_cache(self) -> bool:
+        """Use quick lookup in internal DNS cache for host names if True."""
+        return self._use_dns_cache
+
+    @property
+    def cached_hosts(self) -> MappingProxyType[tuple[str, int], list[ResolveResult]]:
+        """The cache of resolved hosts if dns_cache is enabled.
+
+        The mapping is a read-only snapshot of the current cache
+        contents; mutating it does not affect the connector.
+        """
+        return MappingProxyType(self._cached_hosts.snapshot())
 
     def clear_dns_cache(self, host: str | None = None, port: int | None = None) -> None:
         """Remove specified host/port or clear all dns local cache."""

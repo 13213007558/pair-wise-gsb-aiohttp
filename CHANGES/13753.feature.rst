@@ -1,0 +1,3 @@
+Added the ``dns_cache`` and ``cached_hosts`` read-only properties to
+:class:`aiohttp.TCPConnector`, exposing whether the internal DNS cache is
+enabled and a snapshot of the currently cached hosts -- by :user:`codex`.
