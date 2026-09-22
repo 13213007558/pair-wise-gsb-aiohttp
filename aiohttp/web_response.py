@@ -65,6 +65,34 @@ class ContentCoding(enum.Enum):
 
 CONTENT_CODINGS = {coding.value: coding for coding in ContentCoding}
 
+
+def _parse_accept_encoding(header: str) -> dict[str, float]:
+    """Parse an Accept-Encoding header into a mapping of coding to q-value.
+
+    Codings are lowercased for case-insensitive comparison, the first
+    occurrence wins for duplicated codings and malformed entries are
+    ignored.
+    """
+    qvalues: dict[str, float] = {}
+    for item in header.split(","):
+        coding, _, params = item.partition(";")
+        coding = coding.strip().lower()
+        if not coding:
+            continue
+        q = 1.0
+        for param in params.split(";"):
+            name, _, value = param.partition("=")
+            if name.strip().lower() == "q":
+                try:
+                    q = min(max(float(value.strip()), 0.0), 1.0)
+                except ValueError:
+                    # An unparseable q-value cannot express a preference.
+                    q = 0.0
+                break
+        qvalues.setdefault(coding, q)
+    return qvalues
+
+
 ############################################################
 # HTTP Response classes
 ############################################################
@@ -331,7 +359,7 @@ class StreamResponse(
         if coding is ContentCoding.identity:
             return
         assert self._payload_writer is not None
-        self._headers[hdrs.CONTENT_ENCODING] = coding.value
+        self._set_content_encoding(coding)
         self._payload_writer.enable_compression(
             coding.value, self._compression_strategy
         )
@@ -339,17 +367,76 @@ class StreamResponse(
         # remove the header
         self._headers.popall(hdrs.CONTENT_LENGTH, None)
 
+    def _set_content_encoding(self, coding: ContentCoding) -> None:
+        """Set the Content-Encoding header and adjust cache validators.
+
+        A strong ETag only validates the exact representation data, so it
+        is downgraded to a weak validator when a content coding is applied
+        on the fly. Weak ETags are left untouched.
+        """
+        self._headers[hdrs.CONTENT_ENCODING] = coding.value
+        etag = self.etag
+        if etag is not None and not etag.is_weak and etag.value != ETAG_ANY:
+            self.etag = ETag(value=etag.value, is_weak=True)
+
+    def _ensure_vary_accept_encoding(self) -> None:
+        """Add Accept-Encoding to the Vary header, exactly once."""
+        vary = self._headers.get(hdrs.VARY)
+        if vary is None:
+            self._headers[hdrs.VARY] = hdrs.ACCEPT_ENCODING
+            return
+        tokens = {token.strip().lower() for token in vary.split(",")}
+        if "*" in tokens or str(hdrs.ACCEPT_ENCODING).lower() in tokens:
+            return
+        self._headers[hdrs.VARY] = f"{vary}, {hdrs.ACCEPT_ENCODING}"
+
     async def _start_compression(self, request: "BaseRequest") -> None:
+        # The response varies on Accept-Encoding whether or not this
+        # particular response ends up being compressed.
+        self._ensure_vary_accept_encoding()
+        # Never compress a response that cannot carry a body, except for
+        # HEAD where the headers describe what a GET would have returned.
+        if (
+            must_be_empty_body(request.method, self._status)
+            and request.method != hdrs.METH_HEAD
+        ):
+            return
+        # A partial response is a byte range of the selected representation;
+        # applying a content coding would invalidate the range offsets.
+        if self._status == 206 or hdrs.CONTENT_RANGE in self._headers:
+            return
         if self._compression_force:
             await self._do_start_compression(self._compression_force)
             return
-        # Encoding comparisons should be case-insensitive
-        # https://www.rfc-editor.org/rfc/rfc9110#section-8.4.1
-        accept_encoding = request.headers.get(hdrs.ACCEPT_ENCODING, "").lower()
+        coding = self._choose_content_coding(request)
+        if coding is not None:
+            await self._do_start_compression(coding)
+
+    def _choose_content_coding(self, request: "BaseRequest") -> ContentCoding | None:
+        """Select a content coding from the Accept-Encoding header of the request.
+
+        The coding with the highest q-value wins; ties are broken by the
+        server's own preference order. Codings that are not explicitly
+        listed inherit the q-value of the * wildcard, if present.
+        """
+        if hdrs.ACCEPT_ENCODING not in request.headers:
+            return None
+        # Accept-Encoding is a list-based header field, so the values of
+        # multiple header lines are combined before parsing.
+        accept_encodings = request.headers.getall(hdrs.ACCEPT_ENCODING)
+        qvalues = _parse_accept_encoding(",".join(accept_encodings))
+        wildcard_q = qvalues.get("*")
+        best_coding: ContentCoding | None = None
+        best_q = 0.0
         for value, coding in CONTENT_CODINGS.items():
-            if value in accept_encoding:
-                await self._do_start_compression(coding)
-                return
+            if coding is ContentCoding.identity:
+                # Identity means no coding; there is nothing to start.
+                continue
+            q = qvalues.get(value, wildcard_q if wildcard_q is not None else 0.0)
+            if q > best_q:
+                best_q = q
+                best_coding = coding
+        return best_coding
 
     async def prepare(self, request: "BaseRequest") -> AbstractStreamWriter | None:
         if self._eof_sent:
@@ -722,6 +809,9 @@ class Response(StreamResponse):
             return await super()._do_start_compression(coding)
         if coding is ContentCoding.identity:
             return
+        if self._body is None:
+            # There is no body to compress.
+            return
         # Instead of using _payload_writer.enable_compression,
         # compress the whole body
         compressor = ZLibCompressor(
@@ -729,11 +819,10 @@ class Response(StreamResponse):
             max_sync_chunk_size=self._zlib_executor_size,
             executor=self._zlib_executor,
         )
-        assert self._body is not None
         self._compressed_body = (
             await compressor.compress(self._body) + compressor.flush()
         )
-        self._headers[hdrs.CONTENT_ENCODING] = coding.value
+        self._set_content_encoding(coding)
         self._headers[hdrs.CONTENT_LENGTH] = str(len(self._compressed_body))
 
 

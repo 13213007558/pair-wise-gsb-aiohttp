@@ -409,7 +409,7 @@ class FileResponse(StreamResponse):
 
         if file_encoding:
             self._headers[hdrs.CONTENT_ENCODING] = file_encoding
-            self._headers[hdrs.VARY] = hdrs.ACCEPT_ENCODING
+            self._ensure_vary_accept_encoding()
             # Disable compression if we are already sending
             # a compressed file since we don't want to double
             # compress.

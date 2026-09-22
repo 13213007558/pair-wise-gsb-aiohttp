@@ -712,6 +712,20 @@ and :ref:`aiohttp-web-signals` handlers::
       When *force* is unset compression encoding is selected based on
       the request's *Accept-Encoding* header.
 
+      The coding with the highest q-value is preferred, ties are
+      broken by the server's own preference order, and the ``*``
+      wildcard applies to codings that are not listed explicitly.
+      The response gains a ``Vary: Accept-Encoding`` header (added
+      once) whether or not it ends up being compressed, and a strong
+      ``ETag`` is downgraded to a weak one when a content coding is
+      applied, because the header must describe the representation
+      data actually sent.
+
+      Compression is not applied to responses that cannot carry a
+      body (e.g. ``204`` or ``304``; ``HEAD`` responses still get the
+      headers a ``GET`` would have produced), to partial (``206``)
+      responses, or when a ``Content-Encoding`` header is already set.
+
       *Accept-Encoding* is not checked if *force* is set to a
       :class:`ContentCoding`.
 

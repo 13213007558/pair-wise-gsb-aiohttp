@@ -197,3 +197,32 @@ async def test_sendfile_fallback_respects_count_boundary() -> None:
 
     assert bytes(written) == b"A" * 100
     assert len(written) == 100
+
+
+def test_vary_accept_encoding_merged_for_encoded_file(
+    event_loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Vary: Accept-Encoding is added once, preserving existing Vary values."""
+    request = make_mocked_request(
+        "GET",
+        "http://python.org/logo.png",
+        headers={hdrs.ACCEPT_ENCODING: "gzip"},
+    )
+
+    gz_filepath = mock.create_autospec(Path, spec_set=True)
+    gz_filepath.lstat.return_value.st_size = 1024
+    gz_filepath.lstat.return_value.st_mtime_ns = 1603733507222449291
+    gz_filepath.lstat.return_value.st_mode = MOCK_MODE
+
+    filepath = mock.create_autospec(Path, spec_set=True)
+    filepath.name = "logo.png"
+    filepath.with_suffix.return_value = gz_filepath
+
+    file_sender = FileResponse(filepath, headers={hdrs.VARY: "Cookie"})
+    file_sender._path = filepath
+    file_sender._sendfile = mock.AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    event_loop.run_until_complete(file_sender.prepare(request))
+
+    assert file_sender.headers[hdrs.CONTENT_ENCODING] == "gzip"
+    assert file_sender.headers[hdrs.VARY] == "Cookie, Accept-Encoding"

@@ -1,0 +1,8 @@
+Fixed response compression header semantics: the ``Accept-Encoding``
+negotiation now honours q-values, wildcards and exact coding names,
+``Vary: Accept-Encoding`` is emitted exactly once, strong ``ETag``
+validators are downgraded to weak ones when a content coding is
+applied, and responses that cannot carry a body (such as ``204`` and
+``304``) or partial (``206``) responses are no longer compressed, so
+``Content-Length`` and cache validators always describe the
+representation actually sent -- by :user:`codex`.
