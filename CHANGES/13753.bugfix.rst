@@ -1,0 +1,7 @@
+Hardened the client tracing life cycle: every request now emits exactly
+one terminal signal (``on_request_end`` or ``on_request_exception``, never
+both), ``on_dns_resolvehost_end``, ``on_connection_create_end`` and
+``on_connection_queued_end`` are always paired with their start
+counterparts even on failure, and exceptions raised by trace callbacks
+are logged to the ``aiohttp.client`` logger and swallowed instead of
+changing the outcome of the request -- by :user:`gsb-agent`.

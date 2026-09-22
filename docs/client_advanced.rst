@@ -461,6 +461,24 @@ request time, perhaps::
     session.get('http://example.com/some/redirect/',
                 trace_request_ctx={'foo': 'bar'})
 
+The ``trace_config_ctx`` object is created once per request and per
+:class:`TraceConfig`: it is stable across redirects and connection
+attempts of the same request, and it is never shared between concurrent
+requests or different :class:`TraceConfig` instances.
+
+Every request emits exactly one terminal signal: ``on_request_end``
+once the response headers have been received, or
+``on_request_exception`` if the request fails, is cancelled or times
+out.  After ``on_request_end`` no further terminal signal is emitted;
+in particular, closing the session with an unread response or returning
+the connection to the pool does not emit ``on_request_exception``.
+
+Exceptions raised by signal handlers are logged to the
+``aiohttp.client`` logger and swallowed, so a broken callback cannot
+change the result of the request it observes.  Only
+:exc:`BaseException` (e.g. cancellation) propagates out of a signal
+handler.
+
 
 .. seealso:: :ref:`aiohttp-client-tracing-reference` section for
              more information about the different signals supported.

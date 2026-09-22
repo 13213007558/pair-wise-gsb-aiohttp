@@ -687,10 +687,14 @@ class BaseConnector:
                 if traces:
                     for trace in traces:
                         await trace.send_connection_create_start()
-                proto = await self._create_connection(req, traces, timeout)
-                if traces:
-                    for trace in traces:
-                        await trace.send_connection_create_end()
+                try:
+                    proto = await self._create_connection(req, traces, timeout)
+                finally:
+                    # Pair with create_start so a failed attempt still
+                    # produces a balanced span in trace logs.
+                    if traces:
+                        for trace in traces:
+                            await trace.send_connection_create_end()
             except BaseException:
                 self._release_acquired(key, placeholder)
                 raise
@@ -739,10 +743,14 @@ class BaseConnector:
                 if traces:
                     for trace in traces:
                         await trace.send_connection_queued_start()
-                await fut
-                if traces:
-                    for trace in traces:
-                        await trace.send_connection_queued_end()
+                try:
+                    await fut
+                finally:
+                    # Pair with queued_start: the request leaves the queue
+                    # whether the wait succeeded, timed out or was cancelled.
+                    if traces:
+                        for trace in traces:
+                            await trace.send_connection_queued_end()
             finally:
                 # pop the waiter from the queue if its still
                 # there and not already removed by _release_waiter
@@ -1142,18 +1150,21 @@ class TCPConnector(BaseConnector):
             ]
 
         if not self._use_dns_cache:
+            if self._closed:
+                raise ClientConnectionError("Connector is closed")
+
             if traces:
                 for trace in traces:
                     await trace.send_dns_resolvehost_start(host)
 
-            if self._closed:
-                raise ClientConnectionError("Connector is closed")
-
-            res = await self._resolver.resolve(host, port, family=self._family)
-
-            if traces:
-                for trace in traces:
-                    await trace.send_dns_resolvehost_end(host)
+            try:
+                res = await self._resolver.resolve(host, port, family=self._family)
+            finally:
+                # Pair with resolvehost_start so a failed lookup still
+                # produces a balanced span in trace logs.
+                if traces:
+                    for trace in traces:
+                        await trace.send_dns_resolvehost_end(host)
 
             return res
 
@@ -1246,10 +1257,14 @@ class TCPConnector(BaseConnector):
                 for trace in traces:
                     await trace.send_dns_resolvehost_start(host)
 
-            addrs = await self._resolver.resolve(host, port, family=self._family)
-            if traces:
-                for trace in traces:
-                    await trace.send_dns_resolvehost_end(host)
+            try:
+                addrs = await self._resolver.resolve(host, port, family=self._family)
+            finally:
+                # Pair with resolvehost_start so a failed lookup still
+                # produces a balanced span in trace logs.
+                if traces:
+                    for trace in traces:
+                        await trace.send_dns_resolvehost_end(host)
 
             self._cached_hosts.add(key, addrs)
             for fut in futures:

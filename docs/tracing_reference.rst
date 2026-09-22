@@ -17,6 +17,26 @@ Request life cycle
 
 A request goes through the following stages and corresponding fallbacks.
 
+Every request emits exactly one *terminal* signal: ``on_request_end``
+when the response headers have been received, or ``on_request_exception``
+when the request fails, is cancelled or times out.  They are never both
+emitted for the same request.  Note that ``on_request_end`` does not wait
+for the response body: ``on_response_chunk_received`` may still fire
+afterwards while the body is streamed, and no further signal is emitted
+when the body is fully read, the response is closed unread, the
+connection is returned to the pool or the session is closed.
+
+Exceptions raised by signal handlers are logged to the ``aiohttp.client``
+logger and swallowed: a failing callback never changes the outcome of the
+request being traced, and it is never reported as
+``on_request_exception``.  Only :exc:`BaseException` (e.g. cancellation)
+propagates out of a signal handler.
+
+The ``trace_config_ctx`` object passed to every handler is created once
+per request and per :class:`TraceConfig`, is stable across redirects and
+connection attempts of the same request, and is never shared between
+concurrent requests or between different :class:`TraceConfig` instances.
+
 
 Overview
 ^^^^^^^^
@@ -100,14 +120,15 @@ Connection acquiring
      begin -> reuseconn;
      begin -> create_start;
      create_start -> resolve_dns;
-     resolve_dns -> exception;
      resolve_dns -> sock_connect;
-     sock_connect -> exception;
+     resolve_dns -> create_end;
      sock_connect -> create_end -> end;
+     create_end -> exception;
      begin -> queued_start;
      queued_start -> queued_end;
      queued_end -> reuseconn;
      queued_end -> create_start;
+     queued_end -> exception;
      reuseconn -> end;
 
    }
@@ -157,7 +178,7 @@ DNS resolving
      begin -> cache_hit -> end;
      begin -> cache_miss -> resolve_start;
      resolve_start -> resolve_end -> end;
-     resolve_start -> exception;
+     resolve_end -> exception;
 
    }
 
@@ -260,12 +281,22 @@ Classes
 
       ``params`` is :class:`aiohttp.TraceRequestEndParams` instance.
 
+      .. versionchanged:: 4.0
+
+         Exactly one of ``on_request_end`` and
+         ``on_request_exception`` is emitted per request, never both.
+
    .. attribute:: on_request_exception
 
       Property that gives access to the signals that will be executed when a
       request finishes with an exception.
 
       ``params`` is :class:`aiohttp.TraceRequestExceptionParams` instance.
+
+      .. versionchanged:: 4.0
+
+         Exactly one of ``on_request_end`` and
+         ``on_request_exception`` is emitted per request, never both.
 
    .. attribute:: on_connection_queued_start
 
@@ -283,6 +314,12 @@ Classes
       ``params`` is :class:`aiohttp.TraceConnectionQueuedEndParams`
       instance.
 
+      .. versionchanged:: 4.0
+
+         The signal is now also emitted when the wait is cancelled or
+         times out, so ``on_connection_queued_start`` and
+         ``on_connection_queued_end`` always pair up.
+
    .. attribute:: on_connection_create_start
 
       Property that gives access to the signals that will be executed when a
@@ -298,6 +335,12 @@ Classes
 
       ``params`` is :class:`aiohttp.TraceConnectionCreateEndParams`
       instance.
+
+      .. versionchanged:: 4.0
+
+         The signal is now also emitted when the connection attempt fails,
+         so ``on_connection_create_start`` and
+         ``on_connection_create_end`` always pair up.
 
    .. attribute:: on_connection_reuseconn
 
@@ -321,6 +364,12 @@ Classes
       request finishes to resolve the domain related with the request.
 
       ``params`` is :class:`aiohttp.TraceDnsResolveHostEndParams` instance.
+
+      .. versionchanged:: 4.0
+
+         The signal is now also emitted when the resolution fails, so
+         ``on_dns_resolvehost_start`` and
+         ``on_dns_resolvehost_end`` always pair up.
 
    .. attribute:: on_dns_cache_hit
 

@@ -603,6 +603,7 @@ class ClientSession:
         timer = tm.timer()
         req: ClientRequest | None = None
         resp: ClientResponse | None = None
+        request_ended = False
         try:
             with timer:
                 # https://www.rfc-editor.org/rfc/rfc9112.html#name-retrying-requests
@@ -880,6 +881,11 @@ class ClientSession:
 
             resp._history = tuple(history)
 
+            # The request has succeeded: on_request_end is the terminal
+            # signal. Commit to it before sending so that an interruption
+            # while delivering the callbacks (e.g. cancellation) cannot
+            # make the except block below emit a second terminal signal.
+            request_ended = True
             for trace in traces:
                 await trace.send_request_end(
                     method, url.update_query(params), headers, resp
@@ -900,10 +906,11 @@ class ClientSession:
             if req is not None and req._body is not None:
                 await req._body.close()
 
-            for trace in traces:
-                await trace.send_request_exception(
-                    method, url.update_query(params), headers, e
-                )
+            if not request_ended:
+                for trace in traces:
+                    await trace.send_request_exception(
+                        method, url.update_query(params), headers, e
+                    )
             raise
 
     if sys.version_info >= (3, 11) and TYPE_CHECKING:

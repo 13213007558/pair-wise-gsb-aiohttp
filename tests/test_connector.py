@@ -1667,6 +1667,87 @@ async def test_tcp_connector_dns_tracing_cache_disabled(
         await conn.close()
 
 
+async def test_tcp_connector_dns_tracing_resolve_failure(
+    dns_response_error: Callable[[], Awaitable[NoReturn]],
+) -> None:
+    """dns_resolvehost_end pairs with start even when resolution fails."""
+    session = mock.Mock()
+    trace_config_ctx = mock.Mock()
+    on_dns_resolvehost_start = mock.AsyncMock()
+    on_dns_resolvehost_end = mock.AsyncMock()
+
+    trace_config = aiohttp.TraceConfig(
+        trace_config_ctx_factory=mock.Mock(return_value=trace_config_ctx)
+    )
+    trace_config.on_dns_resolvehost_start.append(on_dns_resolvehost_start)
+    trace_config.on_dns_resolvehost_end.append(on_dns_resolvehost_end)
+    trace_config.freeze()
+    traces = [Trace(session, trace_config, trace_config.trace_config_ctx())]
+
+    with mock.patch("aiohttp.connector.DefaultResolver") as m_resolver:
+        conn = aiohttp.TCPConnector(use_dns_cache=False)
+
+        m_resolver().resolve.return_value = dns_response_error()
+        m_resolver().close = mock.AsyncMock()
+
+        with pytest.raises(socket.gaierror):
+            await conn._resolve_host("localhost", 8080, traces=traces)
+
+        on_dns_resolvehost_start.assert_called_once_with(
+            session,
+            trace_config_ctx,
+            aiohttp.TraceDnsResolveHostStartParams("localhost"),
+        )
+        on_dns_resolvehost_end.assert_called_once_with(
+            session, trace_config_ctx, aiohttp.TraceDnsResolveHostEndParams("localhost")
+        )
+
+        await conn.close()
+
+
+async def test_tcp_connector_dns_tracing_resolve_failure_cached(
+    dns_response_error: Callable[[], Awaitable[NoReturn]],
+) -> None:
+    """dns_resolvehost_end pairs with start on failure with the cache on."""
+    session = mock.Mock()
+    trace_config_ctx = mock.Mock()
+    on_dns_resolvehost_start = mock.AsyncMock()
+    on_dns_resolvehost_end = mock.AsyncMock()
+    on_dns_cache_miss = mock.AsyncMock()
+
+    trace_config = aiohttp.TraceConfig(
+        trace_config_ctx_factory=mock.Mock(return_value=trace_config_ctx)
+    )
+    trace_config.on_dns_resolvehost_start.append(on_dns_resolvehost_start)
+    trace_config.on_dns_resolvehost_end.append(on_dns_resolvehost_end)
+    trace_config.on_dns_cache_miss.append(on_dns_cache_miss)
+    trace_config.freeze()
+    traces = [Trace(session, trace_config, trace_config.trace_config_ctx())]
+
+    with mock.patch("aiohttp.connector.DefaultResolver") as m_resolver:
+        conn = aiohttp.TCPConnector(use_dns_cache=True, ttl_dns_cache=10)
+
+        m_resolver().resolve.return_value = dns_response_error()
+        m_resolver().close = mock.AsyncMock()
+
+        with pytest.raises(socket.gaierror):
+            await conn._resolve_host("localhost", 8080, traces=traces)
+
+        on_dns_cache_miss.assert_called_once_with(
+            session, trace_config_ctx, aiohttp.TraceDnsCacheMissParams("localhost")
+        )
+        on_dns_resolvehost_start.assert_called_once_with(
+            session,
+            trace_config_ctx,
+            aiohttp.TraceDnsResolveHostStartParams("localhost"),
+        )
+        on_dns_resolvehost_end.assert_called_once_with(
+            session, trace_config_ctx, aiohttp.TraceDnsResolveHostEndParams("localhost")
+        )
+
+        await conn.close()
+
+
 async def test_tcp_connector_dns_tracing_throttle_requests(
     dns_response: Callable[[], Awaitable[list[str]]],
 ) -> None:
@@ -1852,6 +1933,97 @@ async def test_connect_tracing(make_client_request: _RequestMaker) -> None:
         on_connection_create_end.assert_called_with(
             session, trace_config_ctx, aiohttp.TraceConnectionCreateEndParams()
         )
+
+
+async def test_connect_tracing_create_end_on_failure(
+    make_client_request: _RequestMaker,
+) -> None:
+    """connection_create_end pairs with start even when creation fails."""
+    loop = asyncio.get_running_loop()
+    session = mock.Mock()
+    trace_config_ctx = mock.Mock()
+    on_connection_create_start = mock.AsyncMock()
+    on_connection_create_end = mock.AsyncMock()
+
+    trace_config = aiohttp.TraceConfig(
+        trace_config_ctx_factory=mock.Mock(return_value=trace_config_ctx)
+    )
+    trace_config.on_connection_create_start.append(on_connection_create_start)
+    trace_config.on_connection_create_end.append(on_connection_create_end)
+    trace_config.freeze()
+    traces = [Trace(session, trace_config, trace_config.trace_config_ctx())]
+
+    req = make_client_request("GET", URL("http://host:80"), loop=loop)
+
+    conn = aiohttp.BaseConnector()
+    with mock.patch.object(
+        conn,
+        "_create_connection",
+        autospec=True,
+        spec_set=True,
+        side_effect=OSError("boom"),
+    ):
+        with pytest.raises(OSError):
+            await conn.connect(req, traces, ClientTimeout())
+
+    on_connection_create_start.assert_called_once_with(
+        session, trace_config_ctx, aiohttp.TraceConnectionCreateStartParams()
+    )
+    on_connection_create_end.assert_called_once_with(
+        session, trace_config_ctx, aiohttp.TraceConnectionCreateEndParams()
+    )
+
+    await conn.close()
+
+
+async def test_connection_queued_tracing_end_on_cancellation(
+    make_client_request: _RequestMaker,
+) -> None:
+    """connection_queued_end pairs with start when the wait is cancelled."""
+    loop = asyncio.get_running_loop()
+    session = mock.Mock()
+    trace_config_ctx = mock.Mock()
+    queued = loop.create_future()
+
+    async def on_connection_queued_start(*args: object, **kwargs: object) -> None:
+        queued.set_result(None)
+
+    on_connection_queued_end = mock.AsyncMock()
+
+    trace_config = aiohttp.TraceConfig(
+        trace_config_ctx_factory=mock.Mock(return_value=trace_config_ctx)
+    )
+    trace_config.on_connection_queued_start.append(on_connection_queued_start)
+    trace_config.on_connection_queued_end.append(on_connection_queued_end)
+    trace_config.freeze()
+    traces = [Trace(session, trace_config, trace_config.trace_config_ctx())]
+
+    proto = create_mocked_conn(loop)
+    proto.is_connected.return_value = True
+
+    req = make_client_request("GET", URL("http://host:80"), loop=loop)
+    key = req.connection_key
+    conn = aiohttp.BaseConnector(limit=1)
+
+    with mock.patch.object(
+        conn, "_create_connection", autospec=True, spec_set=True, return_value=proto
+    ):
+        resp1 = await conn.connect(req, traces, ClientTimeout())
+        assert resp1
+        # 2nd connect request will be queued
+        task = asyncio.create_task(conn.connect(req, traces, ClientTimeout()))
+        await queued
+        list(conn._waiters[key])[0].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    on_connection_queued_end.assert_called_once_with(
+        session, trace_config_ctx, aiohttp.TraceConnectionQueuedEndParams()
+    )
+
+    resp1.close()
+    assert not conn._waiters
+    await conn.close()
 
 
 @pytest.mark.parametrize(

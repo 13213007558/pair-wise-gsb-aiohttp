@@ -3,6 +3,7 @@ import contextlib
 import gc
 import io
 import json
+import logging
 import ssl
 import sys
 import warnings
@@ -1184,10 +1185,11 @@ async def test_response_chunk_received_hook_cleared_on_release(
     assert resp.content._on_chunk_received is None
 
 
-async def test_response_chunk_received_trace_failure_closes_response(
+async def test_response_chunk_received_trace_failure_isolated(
     aiohttp_client: AiohttpClient,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A raising trace handler must tear down the response from .content too."""
+    """A raising trace callback is logged and must not break the response."""
     body = b"x" * 4096
 
     async def handler(request: web.Request) -> web.StreamResponse:
@@ -1211,10 +1213,12 @@ async def test_response_chunk_received_trace_failure_closes_response(
     app.router.add_get("/", handler)
     client = await aiohttp_client(app, trace_configs=[trace_config])
 
-    async with client.get("/") as resp:
-        with pytest.raises(RuntimeError, match="boom"):
-            await resp.content.readany()
-        assert resp.closed
+    with caplog.at_level(logging.ERROR, logger="aiohttp.client"):
+        async with client.get("/") as resp:
+            assert await resp.read() == body
+
+    assert "on_response_chunk_received" in caplog.text
+    assert "boom" in caplog.text
 
 
 async def test_request_tracing_url_params(aiohttp_client: AiohttpClient) -> None:
