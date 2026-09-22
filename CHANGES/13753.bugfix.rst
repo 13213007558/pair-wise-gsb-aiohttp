@@ -1,0 +1,5 @@
+Unified the client and server WebSocket heartbeat, close handshake and
+cancellation handling so every connection reaches a single closed terminal
+state: a pong timeout, transport EOF, an application close or an error now
+always produce exactly one close frame on the wire and fully reclaim the
+heartbeat timers and ping task -- by :user:`Dreamsorcerer`

@@ -259,11 +259,13 @@ class WebSocketWriter:
 
     async def close(self, code: int = 1000, message: bytes | str = b"") -> None:
         """Close the websocket, sending the specified code and message."""
+        if self._closing:
+            # Only one close frame may be sent per connection (RFC 6455);
+            # concurrent or repeated close() calls must not emit another one.
+            return
+        # Mark as closing before sending so a concurrent close() call
+        # cannot race us and emit a second close frame.
+        self._closing = True
         if isinstance(message, str):
             message = message.encode("utf-8")
-        try:
-            await self.send_frame(
-                PACK_CLOSE_CODE(code) + message, opcode=WSMsgType.CLOSE
-            )
-        finally:
-            self._closing = True
+        await self.send_frame(PACK_CLOSE_CODE(code) + message, opcode=WSMsgType.CLOSE)

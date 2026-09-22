@@ -71,12 +71,38 @@ async def test_close(writer: WebSocketWriter) -> None:
     await writer.close(1001, "msg")
     writer.transport.write.assert_called_with(b"\x88\x05\x03\xe9msg")  # type: ignore[attr-defined]
 
-    await writer.close(1001, b"msg")
-    writer.transport.write.assert_called_with(b"\x88\x05\x03\xe9msg")  # type: ignore[attr-defined]
 
-    # Test that Service Restart close code is also supported
+async def test_close_sends_only_one_close_frame(
+    protocol: BaseProtocol, transport: asyncio.Transport
+) -> None:
+    """A connection has a single closing terminal state.
+
+    No matter how many times close() is called, only one close frame
+    may be emitted on the wire.
+    """
+    writer = WebSocketWriter(protocol, transport, use_mask=False)
+    await writer.close(1001, "msg")
+    await writer.close(1001, b"msg")
     await writer.close(1012, b"msg")
-    writer.transport.write.assert_called_with(b"\x88\x05\x03\xf4msg")  # type: ignore[attr-defined]
+    assert transport.write.call_count == 1  # type: ignore[attr-defined]
+    transport.write.assert_called_with(b"\x88\x05\x03\xe9msg")  # type: ignore[attr-defined]
+
+
+async def test_close_with_bytes_message(
+    protocol: BaseProtocol, transport: asyncio.Transport
+) -> None:
+    writer = WebSocketWriter(protocol, transport, use_mask=False)
+    await writer.close(1001, b"msg")
+    transport.write.assert_called_with(b"\x88\x05\x03\xe9msg")  # type: ignore[attr-defined]
+
+
+async def test_close_service_restart(
+    protocol: BaseProtocol, transport: asyncio.Transport
+) -> None:
+    # Test that Service Restart close code is also supported
+    writer = WebSocketWriter(protocol, transport, use_mask=False)
+    await writer.close(1012, b"msg")
+    transport.write.assert_called_with(b"\x88\x05\x03\xf4msg")  # type: ignore[attr-defined]
 
 
 async def test_send_text_masked(

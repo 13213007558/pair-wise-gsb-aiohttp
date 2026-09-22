@@ -2,6 +2,7 @@ import asyncio
 import base64
 import hashlib
 import os
+import random
 from collections.abc import Mapping
 from unittest import mock
 
@@ -12,12 +13,14 @@ from aiohttp import (
     ClientConnectionResetError,
     ClientWSTimeout,
     ServerDisconnectedError,
+    ServerTimeoutError,
+    WSCloseCode,
     client,
     hdrs,
 )
 from aiohttp._websocket.writer import WebSocketWriter as RealWebSocketWriter
-from aiohttp.http import WS_KEY
-from aiohttp.http_websocket import WSMessageClose
+from aiohttp.http import WS_CLOSED_MESSAGE, WS_KEY
+from aiohttp.http_websocket import WSMessageClose, WSMessageText
 from aiohttp.streams import EofStream
 
 
@@ -986,6 +989,254 @@ async def test_ws_connect_deflate_client_wbits_bad(
 
             with pytest.raises(client.WSServerHandshakeError):
                 await aiohttp.ClientSession().ws_connect("http://test.org", compress=15)
+
+
+def _make_client_ws(
+    *,
+    reader: object = None,
+    writer: object = None,
+    response: object = None,
+    heartbeat: float | None = None,
+    timeout: ClientWSTimeout | None = None,
+    loop: object = None,
+) -> client.ClientWebSocketResponse:
+    """Create a ClientWebSocketResponse with mocked dependencies."""
+    if response is None:
+        response = mock.Mock()
+        response.connection = None
+    return client.ClientWebSocketResponse(
+        reader if reader is not None else mock.Mock(),
+        writer if writer is not None else mock.Mock(),
+        None,
+        response,  # type: ignore[arg-type]
+        timeout if timeout is not None else ClientWSTimeout(ws_receive=10.0),
+        True,
+        True,
+        loop if loop is not None else asyncio.get_running_loop(),  # type: ignore[arg-type]
+        heartbeat=heartbeat,
+    )
+
+
+def _close_frames_written(transport: mock.Mock) -> list[bytes]:
+    """Return the close frames written to the transport so far."""
+    return [
+        call[0][0]
+        for call in transport.write.call_args_list
+        if call[0][0][:1] == b"\x88"
+    ]
+
+
+def _assert_heartbeat_reclaimed(resp: client.ClientWebSocketResponse) -> None:
+    """Assert no heartbeat timer or task is left behind."""
+    assert resp._heartbeat_cb is None
+    assert resp._pong_response_cb is None
+    assert resp._ping_task is None
+    assert resp._heartbeat_reset_handle is None
+    assert resp._need_heartbeat_reset is False
+
+
+async def test_pong_timeout_maps_to_server_timeout_error() -> None:
+    """A pong timeout closes the connection with a stable exception mapping."""
+    response = mock.Mock()
+    response.connection = None
+    resp = _make_client_ws(response=response, heartbeat=0.05)
+
+    resp._pong_not_received()
+
+    assert resp.closed
+    assert resp._close_code == WSCloseCode.ABNORMAL_CLOSURE
+    assert isinstance(resp.exception(), ServerTimeoutError)
+    response.close.assert_called_once()
+    _assert_heartbeat_reclaimed(resp)
+
+
+async def test_close_sends_single_close_frame_and_reclaims_heartbeat() -> None:
+    """close() emits exactly one close frame and reclaims the heartbeat."""
+    response = mock.Mock()
+    response.connection = None
+    reader = mock.Mock()
+    reader.read = mock.AsyncMock(
+        return_value=WSMessageClose(data=1000, size=0, extra="close")
+    )
+    transport = mock.Mock()
+    transport.is_closing.return_value = False
+    writer = RealWebSocketWriter(
+        mock.Mock(), transport, use_mask=True, random=random.Random(123)
+    )
+    resp = _make_client_ws(
+        reader=reader,
+        writer=writer,
+        response=response,
+        heartbeat=0.05,
+        timeout=ClientWSTimeout(ws_receive=10.0, ws_close=10.0),
+    )
+    assert resp._heartbeat_cb is not None
+
+    await resp.close()
+    await resp.close()
+
+    assert len(_close_frames_written(transport)) == 1
+    assert resp._close_code == 1000
+    response.close.assert_called_once()
+    _assert_heartbeat_reclaimed(resp)
+
+
+async def test_receive_cancelled_reclaims_heartbeat() -> None:
+    """Cancelling receive() must not leak the heartbeat timers/task."""
+    reader = mock.Mock()
+    reader.read = mock.AsyncMock(side_effect=asyncio.CancelledError())
+    resp = _make_client_ws(reader=reader, heartbeat=0.05)
+    assert resp._heartbeat_cb is not None
+
+    with pytest.raises(asyncio.CancelledError):
+        await resp.receive()
+
+    assert resp._close_code == WSCloseCode.ABNORMAL_CLOSURE
+    _assert_heartbeat_reclaimed(resp)
+
+
+async def test_heartbeat_disabled_no_timers() -> None:
+    """With heartbeat=None no ping timer or pong timeout is ever created."""
+    resp = _make_client_ws()
+
+    resp._on_data_received()
+    await asyncio.sleep(0)
+
+    assert resp._heartbeat_cb is None
+    assert resp._pong_response_cb is None
+    assert resp._heartbeat_reset_handle is None
+    assert resp._ping_task is None
+
+
+async def test_data_received_after_close_does_not_resurrect_heartbeat() -> None:
+    """Late frames after close must not reschedule the heartbeat."""
+    response = mock.Mock()
+    response.connection = None
+    reader = mock.Mock()
+    reader.read = mock.AsyncMock(
+        return_value=WSMessageClose(data=1000, size=0, extra="close")
+    )
+    writer = mock.Mock()
+    writer.close = mock.AsyncMock()
+    resp = _make_client_ws(
+        reader=reader,
+        writer=writer,
+        response=response,
+        heartbeat=0.05,
+        timeout=ClientWSTimeout(ws_receive=10.0, ws_close=10.0),
+    )
+
+    await resp.close()
+    assert resp.closed
+
+    resp._on_data_received()
+    await asyncio.sleep(0)
+
+    _assert_heartbeat_reclaimed(resp)
+
+
+async def test_compressed_frame_then_close_single_close_frame() -> None:
+    """Compressed frames followed by close: exactly one close frame."""
+    response = mock.Mock()
+    response.connection = None
+    reader = mock.Mock()
+    reader.read = mock.AsyncMock(
+        return_value=WSMessageClose(data=1000, size=0, extra="close")
+    )
+    transport = mock.Mock()
+    transport.is_closing.return_value = False
+    writer = RealWebSocketWriter(
+        mock.Mock(),
+        transport,
+        use_mask=True,
+        random=random.Random(123),
+        compress=15,
+    )
+    resp = _make_client_ws(
+        reader=reader,
+        writer=writer,
+        response=response,
+        heartbeat=0.05,
+        timeout=ClientWSTimeout(ws_receive=10.0, ws_close=10.0),
+    )
+
+    await resp.send_str("compressed payload")
+    await resp.close()
+
+    written = [call[0][0] for call in transport.write.call_args_list]
+    # The compressed text frame (FIN|RSV1|TEXT) went out before the close.
+    assert written[0][:1] == b"\xc1"
+    assert len(_close_frames_written(transport)) == 1
+    assert resp.closed
+    _assert_heartbeat_reclaimed(resp)
+
+
+async def test_heartbeat_single_ping_timer_fake_loop() -> None:
+    """One ping timer and one pong timeout per connection, fake loop."""
+    fake_loop = mock.MagicMock()
+    fake_loop.time.return_value = 100.0
+    resp = _make_client_ws(heartbeat=10.0, loop=fake_loop)
+
+    assert fake_loop.call_at.call_count == 1
+    ping_timer = resp._heartbeat_cb
+    assert ping_timer is not None
+
+    # Receiving data coalesces into a single reset and never creates
+    # a second ping timer or a pong timeout.
+    resp._on_data_received()
+    resp._on_data_received()
+    assert fake_loop.call_soon.call_count == 1
+    resp._flush_heartbeat_reset()
+    assert fake_loop.call_at.call_count == 1
+    assert resp._heartbeat_cb is ping_timer
+    assert resp._pong_response_cb is None
+
+    # A pending pong timeout is cancelled when new data arrives.
+    pong_timeout = mock.MagicMock()
+    resp._pong_response_cb = pong_timeout
+    resp._reset_heartbeat()
+    pong_timeout.cancel.assert_called_once()
+    assert resp._pong_response_cb is None
+
+    # Shutdown reclaims the ping timer.
+    resp._cancel_heartbeat()
+    ping_timer.cancel.assert_called_once()
+    _assert_heartbeat_reclaimed(resp)
+
+
+async def test_iterator_early_exit_then_clean_close() -> None:
+    """Breaking out of async iteration must not break the close handshake."""
+    response = mock.Mock()
+    response.connection = None
+    reader = mock.Mock()
+    reader.read = mock.AsyncMock(
+        side_effect=[
+            WSMessageText(data="hello", size=5),
+            WSMessageClose(data=1000, size=0, extra="close"),
+        ]
+    )
+    writer = mock.Mock()
+    writer.close = mock.AsyncMock()
+    resp = _make_client_ws(
+        reader=reader,
+        writer=writer,
+        response=response,
+        heartbeat=0.05,
+        timeout=ClientWSTimeout(ws_receive=10.0, ws_close=10.0),
+    )
+
+    async for msg in resp:
+        assert msg.type == aiohttp.WSMsgType.TEXT
+        break  # application stops iterating early
+
+    await resp.close()
+    assert resp.closed
+    assert resp._close_code == 1000
+    writer.close.assert_awaited_once()
+    _assert_heartbeat_reclaimed(resp)
+
+    # The closed connection cannot be resurrected.
+    assert (await resp.receive()) is WS_CLOSED_MESSAGE
 
 
 async def test_ws_connect_deflate_server_ext_bad(ws_key: str, key_data: bytes) -> None:
