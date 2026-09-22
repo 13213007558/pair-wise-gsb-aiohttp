@@ -16,7 +16,10 @@ import aiohttp
 from aiohttp import BaseConnector, hdrs, payload
 from aiohttp.abc import AbstractStreamWriter
 from aiohttp.base_protocol import BaseProtocol
-from aiohttp.client_exceptions import ClientConnectionError
+from aiohttp.client_exceptions import (
+    ClientConnectionError,
+    ClientPayloadTooLargeError,
+)
 from aiohttp.client_reqrep import (
     ClientRequest,
     ClientRequestArgs,
@@ -1974,6 +1977,273 @@ async def test_write_bytes_empty_iterable_with_content_length(
     # Verify nothing was written
     assert len(buf) == 0
     await req._close()
+
+
+async def test_known_content_length_rejected_before_send(
+    make_client_request: _RequestMaker,
+) -> None:
+    with pytest.raises(ClientPayloadTooLargeError, match="8 bytes produced"):
+        make_client_request(
+            "POST",
+            URL("http://python.org/"),
+            data=b"too much",
+            client_max_size=4,
+        )
+
+
+async def test_unknown_upload_budget_stops_before_tail(
+    buf: bytearray,
+    conn: mock.Mock,
+    make_client_request: _RequestMaker,
+) -> None:
+    close_count = 0
+    produced = 0
+    allow_final = asyncio.Event()
+
+    class Source:
+        def __aiter__(self) -> "Source":
+            return self
+
+        async def __anext__(self) -> bytes:
+            nonlocal produced
+            if produced == 2:
+                await allow_final.wait()
+            if produced == 3:
+                raise StopAsyncIteration
+            produced += 1
+            return b"ab" * produced
+
+        async def aclose(self) -> None:
+            nonlocal close_count
+            close_count += 1
+
+    loop = asyncio.get_running_loop()
+    req = make_client_request(
+        "POST",
+        URL("http://python.org/"),
+        data=Source(),
+        client_max_size=4,
+        loop=loop,
+    )
+    writer = StreamWriter(protocol=conn.protocol, loop=loop)
+    writer.enable_chunking()
+
+    with pytest.raises(ClientPayloadTooLargeError):
+        await req._write_bytes(writer, conn, None)
+    allow_final.set()
+    await asyncio.sleep(0)
+
+    assert produced == 2
+    assert bytes(buf) == b"2\r\nab\r\n2\r\nab\r\n"
+    assert close_count == 1
+    assert req._body.consumed
+    await req._body.close()
+
+
+async def test_expect_continue_does_not_preread_unknown_body(
+    conn: mock.Mock,
+    make_client_request: _RequestMaker,
+) -> None:
+    generated = 0
+
+    async def gen() -> AsyncIterator[bytes]:
+        nonlocal generated
+        generated += 1
+        yield b"chunk"
+
+    loop = asyncio.get_running_loop()
+    req = make_client_request(
+        "POST",
+        URL("http://python.org/"),
+        data=gen(),
+        expect100=True,
+        loop=loop,
+    )
+    writer = StreamWriter(protocol=conn.protocol, loop=loop)
+    task = asyncio.create_task(req._write_bytes(writer, conn, None))
+    await asyncio.sleep(0)
+
+    assert generated == 0
+    assert req._continue is not None
+    req._continue.set_result(True)
+    await task
+
+
+async def test_known_upload_waits_for_resume_before_next_read(
+    buf: bytearray,
+    conn: mock.Mock,
+    make_client_request: _RequestMaker,
+) -> None:
+    loop = asyncio.get_running_loop()
+    data = b"k" * payload.DEFAULT_CHUNK_SIZE * 2
+    stream = io.BytesIO(data)
+    req = make_client_request(
+        "PUT",
+        URL("http://python.org/"),
+        data=stream,
+        loop=loop,
+    )
+    writer = StreamWriter(protocol=conn.protocol, loop=loop)
+    resume = loop.create_future()
+    pause_count = 0
+    resume_count = 0
+
+    async def drain_helper() -> None:
+        nonlocal pause_count, resume_count
+        pause_count += 1
+        await resume
+        conn.protocol._paused = False
+        resume_count += 1
+
+    conn.protocol._paused = True
+    conn.protocol._drain_helper.side_effect = drain_helper
+    task = asyncio.create_task(req._write_bytes(writer, conn, len(data)))
+    while pause_count == 0:
+        await asyncio.sleep(0)
+
+    assert stream.tell() == payload.DEFAULT_CHUNK_SIZE
+    assert pause_count == 1
+    resume.set_result(None)
+    await task
+
+    assert bytes(buf) == data
+    assert (pause_count, resume_count) == (1, 1)
+
+
+async def test_unknown_upload_pause_resume_and_close(
+    buf: bytearray,
+    conn: mock.Mock,
+    make_client_request: _RequestMaker,
+) -> None:
+    loop = asyncio.get_running_loop()
+    close_count = 0
+    produced = 0
+    resume = loop.create_future()
+    pause_count = 0
+    resume_count = 0
+
+    class Source:
+        def __aiter__(self) -> "Source":
+            return self
+
+        async def __anext__(self) -> bytes:
+            nonlocal produced
+            if produced == 2:
+                raise StopAsyncIteration
+            produced += 1
+            return b"abcd"
+
+        async def aclose(self) -> None:
+            nonlocal close_count
+            close_count += 1
+
+    async def drain_helper() -> None:
+        nonlocal pause_count, resume_count
+        pause_count += 1
+        await resume
+        conn.protocol._paused = False
+        resume_count += 1
+
+    req = make_client_request(
+        "POST",
+        URL("http://python.org/"),
+        data=Source(),
+        loop=loop,
+    )
+    writer = StreamWriter(protocol=conn.protocol, loop=loop)
+    writer.enable_chunking()
+    conn.protocol._paused = True
+    conn.protocol._drain_helper.side_effect = drain_helper
+    task = asyncio.create_task(req._write_bytes(writer, conn, None))
+    while pause_count == 0:
+        await asyncio.sleep(0)
+
+    assert produced == 1
+    resume.set_result(None)
+    await task
+
+    assert len(buf) == 2 * (4 + 5) + 5
+    assert (produced, pause_count, resume_count, close_count) == (2, 1, 1, 1)
+
+
+async def test_unknown_upload_cancellation_closes_source_once(
+    conn: mock.Mock,
+    make_client_request: _RequestMaker,
+) -> None:
+    loop = asyncio.get_running_loop()
+    close_count = 0
+    started = loop.create_future()
+    release = loop.create_future()
+
+    class Source:
+        def __aiter__(self) -> "Source":
+            return self
+
+        async def __anext__(self) -> bytes:
+            if not started.done():
+                started.set_result(None)
+                return b"first"
+            await release
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            nonlocal close_count
+            close_count += 1
+
+    req = make_client_request(
+        "POST",
+        URL("http://python.org/"),
+        data=Source(),
+        loop=loop,
+    )
+    resp = await req._send(conn)
+    await started
+    assert resp._writer is not None
+    resp._writer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await resp._writer
+
+    assert close_count == 1
+    await req._body.close()
+    assert close_count == 1
+    await req._body.close()
+    assert close_count == 1
+
+
+async def test_unknown_upload_transport_error_closes_source(
+    conn: mock.Mock,
+    make_client_request: _RequestMaker,
+) -> None:
+    close_count = 0
+
+    class Source:
+        def __aiter__(self) -> "Source":
+            return self
+
+        async def __anext__(self) -> bytes:
+            if hasattr(self, "_done"):
+                raise StopAsyncIteration
+            self._done = True
+            return b"chunk"
+
+        async def aclose(self) -> None:
+            nonlocal close_count
+            close_count += 1
+
+    req = make_client_request(
+        "POST",
+        URL("http://python.org/"),
+        data=Source(),
+        loop=asyncio.get_running_loop(),
+    )
+    conn.protocol._drain_helper.side_effect = ConnectionResetError()
+    conn.protocol._paused = True
+    writer = StreamWriter(protocol=conn.protocol, loop=req.loop)
+    await req._write_bytes(writer, conn, None)
+    await req._body.close()
+
+    assert conn.protocol.set_exception.called
+    assert close_count == 1
 
 
 async def test_update_body_closes_previous_payload(

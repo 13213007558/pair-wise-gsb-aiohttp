@@ -60,7 +60,8 @@ The client session supports the context manager protocol for self closing.
                          max_field_size=8190, \
                          max_headers=128, \
                          fallback_charset_resolver=lambda r, b: "utf-8", \
-                         ssl_shutdown_timeout=0)
+                         ssl_shutdown_timeout=0, \
+                         client_max_size=None)
    :canonical: aiohttp.client.ClientSession
 
    The class for creating client sessions and making requests.
@@ -413,7 +414,8 @@ The client session supports the context manager protocol for self closing.
                          auto_decompress=None, \
                          max_line_size=None, \
                          max_field_size=None, \
-                         max_headers=None)
+                         max_headers=None, \
+                         client_max_size=sentinel)
       :async:
       :noindexentry:
 
@@ -583,6 +585,11 @@ The client session supports the context manager protocol for self closing.
       :param int max_field_size: Maximum allowed size of header name and value combined in responses.
 
       :param int max_headers: Maximum number of headers and trailers combined in responses.
+
+      :param int client_max_size: Maximum number of logical request body bytes
+         to upload. Known lengths are rejected before opening the connection;
+         streaming bodies are stopped after writing this many bytes. ``None``
+         disables the limit; per-request values override the session default.
 
       :return ClientResponse: a :class:`client response <ClientResponse>`
          object.
@@ -2004,6 +2011,13 @@ ClientRequest
       :type: Payload | Literal[b""]
 
       The request body payload (defaults to ``b""`` if no body passed).
+
+   .. attribute:: client_max_size
+      :type: int | None
+
+      Maximum logical request body size for this request attempt. Each
+      redirect or retry receives a fresh byte counter while reusing the same
+      payload object.
 
       .. danger::
 

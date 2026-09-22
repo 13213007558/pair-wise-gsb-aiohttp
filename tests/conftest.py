@@ -497,6 +497,7 @@ async def make_client_request() -> AsyncIterator[_RequestMaker]:
             "traces": [],
             "trust_env": False,
             "server_hostname": None,
+            "client_max_size": None,
         }
         request = ClientRequest(method, url, **(default_args | kwargs))
         requests.append(request)

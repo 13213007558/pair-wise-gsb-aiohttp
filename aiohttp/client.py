@@ -48,6 +48,7 @@ from .client_exceptions import (
     ClientHttpProxyError,
     ClientOSError,
     ClientPayloadError,
+    ClientPayloadTooLargeError,
     ClientProxyConnectionError,
     ClientResponseError,
     ClientSSLError,
@@ -120,6 +121,7 @@ __all__ = (
     "ClientHttpProxyError",
     "ClientOSError",
     "ClientPayloadError",
+    "ClientPayloadTooLargeError",
     "ClientProxyConnectionError",
     "ClientResponseError",
     "ClientSSLError",
@@ -193,6 +195,7 @@ class _RequestOptions(TypedDict, total=False):
     max_line_size: int | None
     max_field_size: int | None
     max_headers: int | None
+    client_max_size: int | _SENTINEL | None
     middlewares: Sequence[ClientMiddlewareType] | None
 
 
@@ -289,6 +292,7 @@ class ClientSession:
         "_default_ssl",
         "_retry_connection",
         "_middlewares",
+        "_client_max_size",
     )
 
     def __init__(
@@ -322,6 +326,7 @@ class ClientSession:
         fallback_charset_resolver: _CharsetResolver = lambda r, b: "utf-8",
         middlewares: Sequence[ClientMiddlewareType] = (),
         ssl_shutdown_timeout: _SENTINEL | None | float = sentinel,
+        client_max_size: int | None = None,
     ) -> None:
         # We initialise _connector to None immediately, as it's referenced in __del__()
         # and could cause issues if an exception occurs during initialisation.
@@ -421,6 +426,9 @@ class ClientSession:
         self._default_ssl = ssl
         self._retry_connection: bool = True
         self._middlewares = tuple(middlewares)
+        if client_max_size is not None and client_max_size < 0:
+            raise ValueError("client_max_size must be non-negative or None")
+        self._client_max_size = client_max_size
 
     def __init_subclass__(cls: type["ClientSession"]) -> None:
         raise TypeError(
@@ -493,6 +501,7 @@ class ClientSession:
         max_line_size: int | None = None,
         max_field_size: int | None = None,
         max_headers: int | None = None,
+        client_max_size: int | None = sentinel,
         middlewares: Sequence[ClientMiddlewareType] | None = None,
     ) -> ClientResponse:
         # NOTE: timeout clamps existing connect and read timeouts.  We cannot
@@ -587,6 +596,8 @@ class ClientSession:
 
         if max_headers is None:
             max_headers = self._max_headers
+        if client_max_size is sentinel:
+            client_max_size = self._client_max_size
 
         traces = [
             Trace(
@@ -709,6 +720,7 @@ class ClientSession:
                         proxy_headers=resolved_proxy_headers,
                         traces=traces,
                         trust_env=self.trust_env,
+                        client_max_size=client_max_size,
                     )
 
                     # Apply middleware (if any) - per-request middleware overrides session middleware

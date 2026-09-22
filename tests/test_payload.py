@@ -2,7 +2,8 @@ import array
 import asyncio
 import io
 import json
-import unittest.mock
+import unittest
+from unittest import mock
 from collections.abc import AsyncIterator, Iterator
 from io import StringIO
 from pathlib import Path
@@ -13,7 +14,9 @@ from multidict import CIMultiDict
 
 from aiohttp import payload
 from aiohttp.abc import AbstractStreamWriter
+from aiohttp.client_exceptions import ClientPayloadTooLargeError
 from aiohttp.helpers import DEFAULT_CHUNK_SIZE
+from aiohttp.http import StreamWriter
 
 
 class BufferWriter(AbstractStreamWriter):
@@ -205,6 +208,83 @@ class MockStreamWriter(AbstractStreamWriter):
     def get_written_bytes(self) -> bytes:
         """Return all written bytes as a single bytes object."""
         return b"".join(self.written)
+
+
+async def test_budgeted_writer_limits_logical_bytes() -> None:
+    underlying = MockStreamWriter()
+    writer = payload.BudgetedStreamWriter(underlying, 5)
+
+    await writer.write(b"12")
+    with pytest.raises(ClientPayloadTooLargeError):
+        await writer.write(b"3456")
+
+    assert underlying.get_written_bytes() == b"12345"
+    assert writer.bytes_written == 5
+
+
+async def test_budgeted_writer_counts_multipart_once() -> None:
+    from aiohttp.multipart import MultipartWriter
+
+    multipart_writer = MultipartWriter("form-data", boundary="boundary")
+    multipart_writer.append(b"abc")
+    underlying = MockStreamWriter()
+    writer = payload.BudgetedStreamWriter(
+        underlying, multipart_writer.size or 0
+    )
+
+    await multipart_writer.write(writer)
+
+    assert writer.bytes_written == multipart_writer.size
+    assert underlying.get_written_bytes() == await multipart_writer.as_bytes()
+
+
+async def test_async_iterable_payload_closes_source_exactly_once() -> None:
+    close_count = 0
+
+    class Source:
+        def __aiter__(self) -> "Source":
+            return self
+
+        async def __anext__(self) -> bytes:
+            if not hasattr(self, "_chunks"):
+                self._chunks = iter((b"chunk1", b"chunk2"))
+            try:
+                return next(self._chunks)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            nonlocal close_count
+            close_count += 1
+
+    p = payload.AsyncIterablePayload(Source())
+    await p.write_with_length(MockStreamWriter(), None)
+    await p.close()
+    await p.close()
+
+    assert close_count == 1
+
+
+async def test_budget_is_before_compression_and_chunk_framing() -> None:
+    buf = bytearray()
+    transport = mock.Mock()
+    transport.write.side_effect = lambda chunk: buf.extend(chunk)
+    transport.writelines.side_effect = lambda chunks: [
+        buf.extend(chunk) for chunk in chunks
+    ]
+    transport.is_closing.return_value = False
+    protocol = mock.Mock(transport=transport)
+    protocol._paused = False
+    writer = StreamWriter(protocol, asyncio.get_running_loop())
+    writer.enable_compression("deflate")
+    writer.enable_chunking()
+    budgeted = payload.BudgetedStreamWriter(writer, 100)
+    body = payload.BytesPayload(b"a" * 100)
+
+    await body.write_with_length(budgeted, None)
+
+    assert budgeted.bytes_written == 100
+    assert len(buf) < 100
 
 
 async def test_bytes_payload_write_with_length_no_limit() -> None:

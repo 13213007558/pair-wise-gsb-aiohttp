@@ -1215,30 +1215,17 @@ class MultipartWriter(Payload):
         if close_boundary:
             await writer.write(b"--" + self._boundary + b"--\r\n")
 
-    async def close(self) -> None:
-        """
-        Close all part payloads that need explicit closing.
-
-        IMPORTANT: This method must not await anything that might not finish
-        immediately, as it may be called during cleanup/cancellation. Schedule
-        any long-running operations without awaiting them.
-        """
-        if self._consumed:
-            return
+    async def _aclose(self) -> None:
         self._consumed = True
-
-        # Close all parts that need explicit closing
-        # We catch and log exceptions to ensure all parts get a chance to close
-        # we do not use asyncio.gather() here because we are not allowed
-        # to suspend given we may be called during cleanup
         for idx, (part, _, _) in enumerate(self._parts):
-            if not part.autoclose and not part.consumed:
-                try:
-                    await part.close()
-                except Exception as exc:
-                    internal_logger.error(
-                        "Failed to close multipart part %d: %s", idx, exc, exc_info=True
-                    )
+            if part.autoclose or part.consumed:
+                continue
+            try:
+                await part.close()
+            except Exception as exc:
+                internal_logger.error(
+                    "Failed to close multipart part %d: %s", idx, exc, exc_info=True
+                )
 
 
 class MultipartPayloadWriter:

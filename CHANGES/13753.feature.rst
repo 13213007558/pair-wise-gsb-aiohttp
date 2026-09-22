@@ -1,0 +1,2 @@
+Added an optional ``client_max_size`` upload budget to ``ClientSession`` and
+``ClientRequest`` -- by :user:`aio-libs`.

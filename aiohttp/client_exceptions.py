@@ -41,6 +41,7 @@ __all__ = (
     "WSServerHandshakeError",
     "ContentTypeError",
     "ClientPayloadError",
+    "ClientPayloadTooLargeError",
     "InvalidURL",
     "InvalidUrlClientError",
     "RedirectClientError",
@@ -259,6 +260,18 @@ class ServerFingerprintMismatch(ServerConnectionError):
 
 class ClientPayloadError(ClientError):
     """Response payload error."""
+
+
+class ClientPayloadTooLargeError(ClientPayloadError):
+    """Request payload exceeds the configured upload size limit."""
+
+    def __init__(self, max_size: int, actual_size: int | None = None) -> None:
+        self.max_size = max_size
+        self.actual_size = actual_size
+        message = f"Request body exceeds the maximum upload size of {max_size} bytes"
+        if actual_size is not None:
+            message += f" ({actual_size} bytes produced)"
+        super().__init__(message)
 
 
 class InvalidURL(ClientError, ValueError):

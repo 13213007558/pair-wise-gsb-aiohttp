@@ -28,6 +28,7 @@ from .base_protocol import BaseProtocol
 from .client_exceptions import (
     ClientConnectionError,
     ClientOSError,
+    ClientPayloadTooLargeError,
     ClientResponseError,
     ContentTypeError,
     InvalidURL,
@@ -852,6 +853,9 @@ class ClientRequestBase:
     def _reset_writer(self, _: object = None) -> None:
         self._writer_task = None
 
+    def _validate_upload_size(self) -> None:
+        """Proxy requests have no upload budget by default."""
+
     def _get_content_length(self) -> int | None:
         """Extract and validate Content-Length header value.
 
@@ -939,6 +943,7 @@ class ClientRequestBase:
         return protocol.writing_paused
 
     async def _send(self, conn: "Connection") -> ClientResponse:
+        self._validate_upload_size()
         # Specify request target:
         # - CONNECT request must send authority form URI
         # - not CONNECT proxy must send absolute form URI
@@ -982,8 +987,9 @@ class ClientRequestBase:
         await writer.write_headers(status_line, self.headers)
 
         task: asyncio.Task[None] | None
+        content_length = self._get_content_length()
         if self._should_write(protocol):
-            coro = self._write_bytes(writer, conn, self._get_content_length())
+            coro = self._write_bytes(writer, conn, content_length)
             if sys.version_info >= (3, 14):
                 # Try to write bytes immediately to avoid having to schedule
                 # the task on the event loop.
@@ -1044,6 +1050,7 @@ class ClientRequestArgs(TypedDict, total=False):
     proxy_headers: CIMultiDict[str] | None
     traces: list["Trace"]
     trust_env: bool
+    client_max_size: int | None
     server_hostname: str | None
 
 
@@ -1053,6 +1060,7 @@ class ClientRequest(ClientRequestBase):
     _continue = None  # waiter future for '100 Continue' response
     _response_params: ResponseParams = None  # type: ignore[assignment]
     _session: "ClientSession" = None  # type: ignore[assignment]
+    _client_max_size: int | None = None
     _timeout = ClientTimeout()
     _traces: list["Trace"] = ()  # type: ignore[assignment]
 
@@ -1093,6 +1101,7 @@ class ClientRequest(ClientRequestBase):
         traces: list["Trace"],
         trust_env: bool,
         server_hostname: str | None,
+        client_max_size: int | None = None,
         **kwargs: object,
     ):
         # kwargs exists so authors of subclasses should expect to pass through unknown
@@ -1126,6 +1135,10 @@ class ClientRequest(ClientRequestBase):
             self._update_transfer_encoding()
         self._update_expect_continue(expect100)
         self._traces = traces
+        if client_max_size is not None and client_max_size < 0:
+            raise ValueError("client_max_size must be non-negative or None")
+        self._client_max_size = client_max_size
+        self._validate_upload_size()
 
     @property
     def body(self) -> payload.Payload:
@@ -1139,6 +1152,11 @@ class ClientRequest(ClientRequestBase):
     def timeout(self) -> ClientTimeout:
         """The timeout configuration this request runs under (read-only)."""
         return self._timeout
+
+    @property
+    def client_max_size(self) -> int | None:
+        """Maximum logical request body size for this attempt."""
+        return self._client_max_size
 
     @property
     def connection_key(self) -> ConnectionKey:
@@ -1370,6 +1388,7 @@ class ClientRequest(ClientRequestBase):
         if self._body is not None:
             await self._body.close()
         self._update_body(body)
+        self._validate_upload_size()
 
     def _update_expect_continue(self, expect: bool = False) -> None:
         if expect:
@@ -1382,6 +1401,14 @@ class ClientRequest(ClientRequestBase):
 
         if expect:
             self._continue = self.loop.create_future()
+
+    def _validate_upload_size(self) -> None:
+        max_size = self._client_max_size
+        if max_size is None:
+            return
+        content_length = self._get_content_length()
+        if content_length is not None and content_length > max_size:
+            raise ClientPayloadTooLargeError(max_size, content_length)
 
     def _update_proxy(
         self,
@@ -1497,8 +1524,17 @@ class ClientRequest(ClientRequestBase):
 
         protocol = conn.protocol
         assert protocol is not None
+        body_writer: AbstractStreamWriter = writer
+        if self._client_max_size is not None and content_length is None:
+            body_writer = payload.BudgetedStreamWriter(
+                writer, self._client_max_size
+            )
         try:
-            await self._body.write_with_length(writer, content_length)
+            await self._body.write_with_length(body_writer, content_length)
+        except ClientPayloadTooLargeError as exc:
+            set_exception(protocol, ClientConnectionError(str(exc)), exc)
+            conn.close()
+            raise
         except OSError as underlying_exc:
             reraised_exc = underlying_exc
 

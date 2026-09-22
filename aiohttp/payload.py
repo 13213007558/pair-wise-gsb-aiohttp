@@ -15,6 +15,7 @@ from multidict import CIMultiDict
 
 from . import hdrs
 from .abc import AbstractStreamWriter
+from .client_exceptions import ClientPayloadTooLargeError
 from .helpers import (
     _SENTINEL,
     DEFAULT_CHUNK_SIZE,
@@ -42,10 +43,77 @@ __all__ = (
     "JsonPayload",
     "JsonBytesPayload",
     "AsyncIterablePayload",
+    "BudgetedStreamWriter",
 )
 
 TOO_LARGE_BYTES_BODY: Final[int] = 2**20  # 1 MB
 _CLOSE_FUTURES: set[asyncio.Future[None]] = set()
+
+
+class BudgetedStreamWriter(AbstractStreamWriter):
+    """Count logical payload bytes before HTTP compression or chunk framing."""
+
+    length: int | None = 0
+
+    def __init__(self, writer: AbstractStreamWriter, max_size: int) -> None:
+        self._writer = writer
+        self._max_size = max_size
+        self.bytes_written = 0
+
+    @property
+    def buffer_size(self) -> int:
+        return self._writer.buffer_size
+
+    @buffer_size.setter
+    def buffer_size(self, value: int) -> None:
+        self._writer.buffer_size = value
+
+    @property
+    def output_size(self) -> int:
+        return self._writer.output_size
+
+    async def write(
+        self,
+        chunk: "bytes | bytearray | memoryview[int] | memoryview[bytes]",
+    ) -> None:
+        if self.bytes_written >= self._max_size:
+            raise ClientPayloadTooLargeError(
+                self._max_size, self.bytes_written
+            )
+
+        chunk_len = len(chunk)
+        remaining = self._max_size - self.bytes_written
+        if chunk_len > remaining:
+            chunk = chunk[:remaining]
+        await self._writer.write(chunk)
+        await self._writer.drain()
+        self.bytes_written += len(chunk)
+        if chunk_len > remaining:
+            raise ClientPayloadTooLargeError(
+                self._max_size, self.bytes_written
+            )
+
+    async def write_eof(self, chunk: bytes = b"") -> None:
+        await self._writer.write_eof(chunk)
+
+    async def drain(self) -> None:
+        await self._writer.drain()
+
+    def enable_compression(
+        self, encoding: str = "deflate", strategy: int | None = None
+    ) -> None:
+        self._writer.enable_compression(encoding, strategy)
+
+    def enable_chunking(self) -> None:
+        self._writer.enable_chunking()
+
+    async def write_headers(
+        self, status_line: str, headers: CIMultiDict[str]
+    ) -> None:
+        await self._writer.write_headers(status_line, headers)
+
+    def send_headers(self) -> None:
+        self._writer.send_headers()
 
 
 class LookupError(Exception):
@@ -174,6 +242,8 @@ class Payload(ABC):
             self._headers[hdrs.CONTENT_TYPE] = self._default_content_type
         if headers:
             self._headers.update(headers)
+        self._closed = False
+        self._close_lock = asyncio.Lock()
 
     @property
     def size(self) -> int | None:
@@ -307,34 +377,23 @@ class Payload(ABC):
         return self.decode(actual_encoding, errors).encode(actual_encoding)
 
     def _close(self) -> None:
-        """
-        Async safe synchronous close operations for backwards compatibility.
+        """Synchronous, non-blocking cleanup hook."""
 
-        This method exists only for backwards compatibility with code that
-        needs to clean up payloads synchronously. In the future, we will
-        drop this method and only support the async close() method.
-
-        WARNING: This method must be safe to call from within the event loop
-        without blocking. Subclasses should not perform any blocking I/O here.
-
-        WARNING: This method must be called from within an event loop for
-        certain payload types (e.g., IOBasePayload). Calling it outside an
-        event loop may raise RuntimeError.
-        """
-        # This is a no-op by default, but subclasses can override it
-        # for non-blocking cleanup operations.
+    async def _aclose(self) -> None:
+        """Async cleanup hook for releasing payload resources."""
+        self._close()
 
     async def close(self) -> None:
         """
-        Close the payload if it holds any resources.
-
-        IMPORTANT: This method must not await anything that might not finish
-        immediately, as it may be called during cleanup/cancellation. Schedule
-        any long-running operations without awaiting them.
-
-        In the future, this will be the only close method supported.
+        Close the payload exactly once.
         """
-        self._close()
+        if self._closed:
+            return
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            await self._aclose()
 
 
 class BytesPayload(Payload):
@@ -663,36 +722,13 @@ class IOBasePayload(Payload):
         )
 
     def _close(self) -> None:
-        """
-        Async safe synchronous close operations for backwards compatibility.
-
-        This method exists only for backwards
-        compatibility. Use the async close() method instead.
-
-        WARNING: This method MUST be called from within an event loop.
-        Calling it outside an event loop will raise RuntimeError.
-        """
-        # Skip if already consumed
         if self._consumed:
             return
-        self._consumed = True  # Mark as consumed to prevent further writes
-        # Schedule file closing without awaiting to prevent cancellation issues
+        self._consumed = True
         loop = asyncio.get_running_loop()
         close_future = loop.run_in_executor(None, self._value.close)
-        # Hold a strong reference to the future to prevent it from being
-        # garbage collected before it completes.
         _CLOSE_FUTURES.add(close_future)
         close_future.add_done_callback(_CLOSE_FUTURES.remove)
-
-    async def close(self) -> None:
-        """
-        Close the payload if it holds any resources.
-
-        IMPORTANT: This method must not await anything that might not finish
-        immediately, as it may be called during cleanup/cancellation. Schedule
-        any long-running operations without awaiting them.
-        """
-        self._close()
 
     def decode(self, encoding: str = "utf-8", errors: str = "strict") -> str:
         """
@@ -978,7 +1014,7 @@ class AsyncIterablePayload(Payload):
     _value: AsyncIterable[bytes]
     _cached_chunks: list[bytes] | None = None
     # _consumed stays False to allow reuse with cached content
-    _autoclose = True  # Iterator doesn't need explicit closing
+    _autoclose = False  # The iterator may own resources that need closing
 
     def __init__(self, value: AsyncIterable[bytes], *args: Any, **kwargs: Any) -> None:
         if not isinstance(value, AsyncIterable):
@@ -994,6 +1030,15 @@ class AsyncIterablePayload(Payload):
         super().__init__(value, *args, **kwargs)
 
         self._iter = value.__aiter__()
+        self._iter_lock = asyncio.Lock()
+
+    async def _close_iterator(self, iterator: AsyncIterator[bytes]) -> None:
+        if self._iter is not iterator:
+            return
+        self._iter = None
+        close = getattr(iterator, "aclose", None)
+        if close is not None:
+            await close()
 
     async def write(self, writer: AbstractStreamWriter) -> None:
         """
@@ -1047,29 +1092,27 @@ class AsyncIterablePayload(Payload):
         if self._iter is None:
             return
 
-        # Stream from the iterator
         remaining_bytes = content_length
-        # Nothing is cached, so advancing the iterator is irreversible: mark the
-        # payload consumed up front so an interrupted write cannot be replayed
-        # from a partially drained iterator.
         self._consumed = True
-
-        try:
-            while True:
-                chunk = await anext(self._iter)
-                if remaining_bytes is None:
-                    await writer.write(chunk)
-                # If we have a content length limit
-                elif remaining_bytes > 0:
-                    await writer.write(chunk[:remaining_bytes])
-                    remaining_bytes -= len(chunk)
-                # We still want to exhaust the iterator even
-                # if we have reached the content length limit
-                # since the file handle may not get closed by
-                # the iterator if we don't do this
-        except StopAsyncIteration:
-            # Iterator is exhausted
-            self._iter = None
+        async with self._iter_lock:
+            iterator = self._iter
+            if iterator is None:
+                return
+            try:
+                while True:
+                    chunk = await anext(iterator)
+                    if remaining_bytes is None:
+                        await writer.write(chunk)
+                    elif remaining_bytes > 0:
+                        await writer.write(chunk[:remaining_bytes])
+                        remaining_bytes -= len(chunk)
+                    else:
+                        break
+            except StopAsyncIteration:
+                pass
+            finally:
+                if self._iter is iterator:
+                    await self._close_iterator(iterator)
 
     def decode(self, encoding: str = "utf-8", errors: str = "strict") -> str:
         """Decode the payload content as a string if cached chunks are available."""
@@ -1092,17 +1135,26 @@ class AsyncIterablePayload(Payload):
         if self._iter is None:
             return b""
 
-        # Read all chunks and cache them
         chunks: list[bytes] = []
-        async for chunk in self._iter:
-            chunks.append(chunk)
+        async with self._iter_lock:
+            iterator = self._iter
+            if iterator is None:
+                return b""
+            try:
+                async for chunk in iterator:
+                    chunks.append(chunk)
+            finally:
+                if self._iter is iterator:
+                    await self._close_iterator(iterator)
 
-        # Iterator is exhausted, cache the chunks
-        self._iter = None
-        self._cached_chunks = chunks
-        # Keep _consumed as False to allow reuse with cached chunks
+            self._cached_chunks = chunks
+            return b"".join(chunks)
 
-        return b"".join(chunks)
+    async def _aclose(self) -> None:
+        iterator = self._iter
+        if iterator is not None:
+            async with self._iter_lock:
+                await self._close_iterator(iterator)
 
 
 class StreamReaderPayload(AsyncIterablePayload):
