@@ -181,6 +181,21 @@ DNS resolving
    * - cache_miss
      - on_dns_cache_miss
 
+Callback exceptions
+-------------------
+
+Exceptions raised by trace callbacks are logged to the ``aiohttp.client``
+logger and never change the outcome of the request being traced.  Every
+request emits exactly one terminal signal per :class:`TraceConfig` --
+either ``on_request_end`` or ``on_request_exception`` -- even when the
+request is cancelled, times out, or a callback fails while a signal is
+being delivered.
+
+The only signal that does not follow this rule is
+``on_response_chunk_received``: it is delivered from the response stream
+while the caller is reading it, so a callback error is re-raised to the
+reader and the response is closed.
+
 Classes
 -------
 

@@ -7,6 +7,7 @@ from yarl import URL
 
 from .client_reqrep import ClientResponse
 from .helpers import frozen_dataclass_decorator
+from .log import client_logger
 
 if TYPE_CHECKING:
     from .client import ClientSession
@@ -335,6 +336,13 @@ class Trace:
 
     Used to keep together the main dependencies used
     at the moment of send a signal.
+
+    Exceptions raised by trace callbacks are logged and swallowed for
+    every signal except `on_response_chunk_received`, so a misbehaving
+    callback can never change the outcome of the request being traced.
+    `on_response_chunk_received` is delivered from the response stream
+    while the caller is reading it; there an error is re-raised to the
+    reader and the response is closed instead.
     """
 
     def __init__(
@@ -347,21 +355,29 @@ class Trace:
         self._trace_config_ctx = trace_config_ctx
         self._session = session
 
+    async def _dispatch(
+        self, name: str, signal: "_TracingSignal[Any, Any]", params: object
+    ) -> None:
+        try:
+            await signal.send(self._session, self._trace_config_ctx, params)
+        except Exception:
+            client_logger.exception("Error in %s trace callback", name)
+
     async def send_request_start(
         self, method: str, url: URL, headers: "CIMultiDict[str]"
     ) -> None:
-        return await self._trace_config.on_request_start.send(
-            self._session,
-            self._trace_config_ctx,
+        await self._dispatch(
+            "on_request_start",
+            self._trace_config.on_request_start,
             TraceRequestStartParams(method, url, headers),
         )
 
     async def send_request_chunk_sent(
         self, method: str, url: URL, chunk: bytes
     ) -> None:
-        return await self._trace_config.on_request_chunk_sent.send(
-            self._session,
-            self._trace_config_ctx,
+        await self._dispatch(
+            "on_request_chunk_sent",
+            self._trace_config.on_request_chunk_sent,
             TraceRequestChunkSentParams(method, url, chunk),
         )
 
@@ -381,9 +397,9 @@ class Trace:
         headers: "CIMultiDict[str]",
         response: ClientResponse,
     ) -> None:
-        return await self._trace_config.on_request_end.send(
-            self._session,
-            self._trace_config_ctx,
+        await self._dispatch(
+            "on_request_end",
+            self._trace_config.on_request_end,
             TraceRequestEndParams(method, url, headers, response),
         )
 
@@ -394,9 +410,9 @@ class Trace:
         headers: "CIMultiDict[str]",
         exception: BaseException,
     ) -> None:
-        return await self._trace_config.on_request_exception.send(
-            self._session,
-            self._trace_config_ctx,
+        await self._dispatch(
+            "on_request_exception",
+            self._trace_config.on_request_exception,
             TraceRequestExceptionParams(method, url, headers, exception),
         )
 
@@ -407,62 +423,80 @@ class Trace:
         headers: "CIMultiDict[str]",
         response: ClientResponse,
     ) -> None:
-        return await self._trace_config._on_request_redirect.send(
-            self._session,
-            self._trace_config_ctx,
+        await self._dispatch(
+            "on_request_redirect",
+            self._trace_config.on_request_redirect,
             TraceRequestRedirectParams(method, url, headers, response),
         )
 
     async def send_connection_queued_start(self) -> None:
-        return await self._trace_config.on_connection_queued_start.send(
-            self._session, self._trace_config_ctx, TraceConnectionQueuedStartParams()
+        await self._dispatch(
+            "on_connection_queued_start",
+            self._trace_config.on_connection_queued_start,
+            TraceConnectionQueuedStartParams(),
         )
 
     async def send_connection_queued_end(self) -> None:
-        return await self._trace_config.on_connection_queued_end.send(
-            self._session, self._trace_config_ctx, TraceConnectionQueuedEndParams()
+        await self._dispatch(
+            "on_connection_queued_end",
+            self._trace_config.on_connection_queued_end,
+            TraceConnectionQueuedEndParams(),
         )
 
     async def send_connection_create_start(self) -> None:
-        return await self._trace_config.on_connection_create_start.send(
-            self._session, self._trace_config_ctx, TraceConnectionCreateStartParams()
+        await self._dispatch(
+            "on_connection_create_start",
+            self._trace_config.on_connection_create_start,
+            TraceConnectionCreateStartParams(),
         )
 
     async def send_connection_create_end(self) -> None:
-        return await self._trace_config.on_connection_create_end.send(
-            self._session, self._trace_config_ctx, TraceConnectionCreateEndParams()
+        await self._dispatch(
+            "on_connection_create_end",
+            self._trace_config.on_connection_create_end,
+            TraceConnectionCreateEndParams(),
         )
 
     async def send_connection_reuseconn(self) -> None:
-        return await self._trace_config.on_connection_reuseconn.send(
-            self._session, self._trace_config_ctx, TraceConnectionReuseconnParams()
+        await self._dispatch(
+            "on_connection_reuseconn",
+            self._trace_config.on_connection_reuseconn,
+            TraceConnectionReuseconnParams(),
         )
 
     async def send_dns_resolvehost_start(self, host: str) -> None:
-        return await self._trace_config.on_dns_resolvehost_start.send(
-            self._session, self._trace_config_ctx, TraceDnsResolveHostStartParams(host)
+        await self._dispatch(
+            "on_dns_resolvehost_start",
+            self._trace_config.on_dns_resolvehost_start,
+            TraceDnsResolveHostStartParams(host),
         )
 
     async def send_dns_resolvehost_end(self, host: str) -> None:
-        return await self._trace_config.on_dns_resolvehost_end.send(
-            self._session, self._trace_config_ctx, TraceDnsResolveHostEndParams(host)
+        await self._dispatch(
+            "on_dns_resolvehost_end",
+            self._trace_config.on_dns_resolvehost_end,
+            TraceDnsResolveHostEndParams(host),
         )
 
     async def send_dns_cache_hit(self, host: str) -> None:
-        return await self._trace_config.on_dns_cache_hit.send(
-            self._session, self._trace_config_ctx, TraceDnsCacheHitParams(host)
+        await self._dispatch(
+            "on_dns_cache_hit",
+            self._trace_config.on_dns_cache_hit,
+            TraceDnsCacheHitParams(host),
         )
 
     async def send_dns_cache_miss(self, host: str) -> None:
-        return await self._trace_config.on_dns_cache_miss.send(
-            self._session, self._trace_config_ctx, TraceDnsCacheMissParams(host)
+        await self._dispatch(
+            "on_dns_cache_miss",
+            self._trace_config.on_dns_cache_miss,
+            TraceDnsCacheMissParams(host),
         )
 
     async def send_request_headers(
         self, method: str, url: URL, headers: "CIMultiDict[str]"
     ) -> None:
-        return await self._trace_config._on_request_headers_sent.send(
-            self._session,
-            self._trace_config_ctx,
+        await self._dispatch(
+            "on_request_headers_sent",
+            self._trace_config.on_request_headers_sent,
             TraceRequestHeadersSentParams(method, url, headers),
         )

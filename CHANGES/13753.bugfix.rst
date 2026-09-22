@@ -1,0 +1,5 @@
+Guaranteed that client tracing emits exactly one terminal signal
+(``on_request_end`` or ``on_request_exception``) per request -- including
+when the request is cancelled or times out -- and isolated trace callback
+errors, which are now logged to the ``aiohttp.client`` logger instead of
+changing the request outcome -- by :user:`codex`.

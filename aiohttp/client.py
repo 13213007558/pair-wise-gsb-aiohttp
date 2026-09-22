@@ -254,6 +254,26 @@ async def _connect_and_send_request(req: ClientRequest) -> ClientResponse:
     return resp
 
 
+async def _broadcast_trace_signal(
+    traces: list[Trace], signal_name: str, *args: Any
+) -> None:
+    """Deliver a trace signal to every trace.
+
+    Delivery is finished for the remaining traces even if the task is
+    cancelled mid-way, so each trace observes a complete lifecycle; a
+    pending cancellation is re-raised once every trace has been notified.
+    """
+    cancelled: asyncio.CancelledError | None = None
+    for trace in traces:
+        try:
+            await getattr(trace, signal_name)(*args)
+        except asyncio.CancelledError as exc:
+            if cancelled is None:
+                cancelled = exc
+    if cancelled is not None:
+        raise cancelled
+
+
 @final
 class ClientSession:
     """First-class interface for making HTTP requests."""
@@ -597,13 +617,17 @@ class ClientSession:
             for trace_config in self._trace_configs
         ]
 
-        for trace in traces:
-            await trace.send_request_start(method, url.update_query(params), headers)
-
         timer = tm.timer()
         req: ClientRequest | None = None
         resp: ClientResponse | None = None
+        # Set once the terminal signal (on_request_end) has been delivered to
+        # every trace; the except path below delivers on_request_exception
+        # instead, so each request emits exactly one terminal signal per trace.
+        trace_end_sent = False
         try:
+            await _broadcast_trace_signal(
+                traces, "send_request_start", method, url.update_query(params), headers
+            )
             with timer:
                 # https://www.rfc-editor.org/rfc/rfc9112.html#name-retrying-requests
                 retry_persistent_connection = (
@@ -880,10 +904,17 @@ class ClientSession:
 
             resp._history = tuple(history)
 
-            for trace in traces:
-                await trace.send_request_end(
-                    method, url.update_query(params), headers, resp
+            try:
+                await _broadcast_trace_signal(
+                    traces,
+                    "send_request_end",
+                    method,
+                    url.update_query(params),
+                    headers,
+                    resp,
                 )
+            finally:
+                trace_end_sent = True
             return resp
 
         except BaseException as e:
@@ -900,9 +931,14 @@ class ClientSession:
             if req is not None and req._body is not None:
                 await req._body.close()
 
-            for trace in traces:
-                await trace.send_request_exception(
-                    method, url.update_query(params), headers, e
+            if not trace_end_sent:
+                await _broadcast_trace_signal(
+                    traces,
+                    "send_request_exception",
+                    method,
+                    url.update_query(params),
+                    headers,
+                    e,
                 )
             raise
 
