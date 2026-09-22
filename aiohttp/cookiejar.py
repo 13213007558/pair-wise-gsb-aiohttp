@@ -410,7 +410,9 @@ class CookieJar(AbstractCookieJar):
                     cookie["max-age"] = ""
 
             elif expires := cookie["expires"]:
-                if expire_time := self._parse_date(expires):
+                # A parsed expiration of 0 (the epoch) is a valid date and is
+                # how servers delete cookies, so check for None explicitly.
+                if (expire_time := self._parse_date(expires)) is not None:
                     self._expire_cookie(expire_time, domain, path, name)
                 else:
                     cookie["expires"] = ""

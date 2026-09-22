@@ -866,6 +866,44 @@ def test_explicit_domain_replacement_clears_host_only_marker() -> None:
     assert jar.filter_cookies(subdomain)["sid"].value == "domainwide"
 
 
+def test_expires_at_epoch_deletes_cookie() -> None:
+    """Expires=Thu, 01 Jan 1970 00:00:00 GMT must delete the cookie.
+
+    The epoch is the canonical deletion date sent by servers; a parsed
+    expiration of 0 is a valid date, not a parse failure.
+    """
+    jar = CookieJar()
+    origin = URL("http://example.com/")
+
+    jar.update_cookies_from_headers(["sid=secret; Path=/"], origin)
+    assert jar.filter_cookies(origin)["sid"].value == "secret"
+
+    jar.update_cookies_from_headers(
+        ["sid=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT"], origin
+    )
+
+    assert len(jar) == 0
+    assert "sid" not in jar.filter_cookies(origin)
+
+
+def test_expires_at_epoch_deletes_only_matching_path() -> None:
+    """Deleting a cookie must not remove same-name cookies on other paths."""
+    jar = CookieJar()
+    origin = URL("http://example.com/")
+
+    jar.update_cookies_from_headers(["sid=root; Path=/"], origin)
+    jar.update_cookies_from_headers(["sid=narrow; Path=/app"], origin)
+
+    jar.update_cookies_from_headers(
+        ["sid=; Path=/app; Expires=Thu, 01 Jan 1970 00:00:00 GMT"], origin
+    )
+
+    assert len(jar) == 1
+    assert jar.filter_cookies(origin)["sid"].value == "root"
+    filtered = jar.filter_cookies(URL("http://example.com/app/x"))
+    assert filtered["sid"].value == "root"
+
+
 async def test_cookie_jar_cookies_property_immutable() -> None:
     jar = CookieJar()
     cookie = SimpleCookie("foo=bar;")

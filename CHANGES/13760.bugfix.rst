@@ -1,0 +1,5 @@
+Fixed :class:`~aiohttp.CookieJar` not deleting a cookie when the server
+sent ``Expires=Thu, 01 Jan 1970 00:00:00 GMT`` (the epoch, the canonical
+cookie-deletion date) without a ``Max-Age`` attribute; the parsed
+expiration of ``0`` was mistaken for a parse failure, so the cookie
+survived as a session cookie and kept being sent -- by :user:`aiohttp`.
