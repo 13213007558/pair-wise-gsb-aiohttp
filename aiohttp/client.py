@@ -18,7 +18,6 @@ from collections.abc import (
     Iterable,
     Sequence,
 )
-from contextlib import suppress
 from types import TracebackType
 from typing import (
     TYPE_CHECKING,
@@ -90,9 +89,9 @@ from .helpers import (
     DEFAULT_CHUNK_SIZE,
     EMPTY_BODY_METHODS,
     HTTP_AND_EMPTY_SCHEMA_SET,
+    ProxyConfig,
     TimeoutHandle,
     _auth_header_from_netrc,
-    get_env_proxy_for_url,
     netrc_from_env,
     sentinel,
     strip_auth_from_url,
@@ -274,6 +273,7 @@ class ClientSession:
         "_raise_for_status",
         "_auto_decompress",
         "_trust_env",
+        "_env_proxy_config",
         "_default_headers",
         "_skip_auto_headers",
         "_request_class",
@@ -390,6 +390,13 @@ class ClientSession:
         self._raise_for_status = raise_for_status
         self._auto_decompress = auto_decompress
         self._trust_env = trust_env
+        # Snapshot the environment proxy configuration once, at session
+        # creation, so that every request routed by this session sees the
+        # same immutable view and no mutable proxy state is shared between
+        # sessions or threads.
+        self._env_proxy_config: ProxyConfig | None = (
+            ProxyConfig.from_env() if trust_env else None
+        )
         self._requote_redirect_url = requote_redirect_url
         self._read_bufsize = read_bufsize
         self._max_line_size = max_line_size
@@ -659,17 +666,23 @@ class ClientSession:
                     proxy_: URL | None = None
                     if proxy is not None:
                         proxy_ = URL(proxy)
-                    elif self._trust_env:
-                        # Re-resolve per iteration; drop stale env-proxy auth so
-                        # a redirect that switches proxies can't leak credentials.
+                    elif self._env_proxy_config is not None:
+                        # Re-evaluate each redirect target against the
+                        # session's immutable env snapshot; drop stale
+                        # env-proxy auth so a redirect that switches
+                        # proxies can't leak credentials to the next hop.
                         resolved_proxy_headers = None
-                        with suppress(LookupError):
-                            proxy_, env_proxy_auth = await asyncio.to_thread(
-                                get_env_proxy_for_url, url
-                            )
-                            if env_proxy_auth is not None:
+                        if self._connector.supports_proxy:
+                            proxy_info = self._env_proxy_config.proxy_for(url)
+                        else:
+                            # e.g. Unix sockets and named pipes always
+                            # connect directly.
+                            proxy_info = None
+                        if proxy_info is not None:
+                            proxy_ = proxy_info.proxy
+                            if proxy_info.proxy_auth is not None:
                                 resolved_proxy_headers = CIMultiDict(
-                                    {hdrs.PROXY_AUTHORIZATION: env_proxy_auth}
+                                    {hdrs.PROXY_AUTHORIZATION: proxy_info.proxy_auth}
                                 )
 
                     response_params: ResponseParams = {

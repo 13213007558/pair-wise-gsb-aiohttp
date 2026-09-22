@@ -187,7 +187,9 @@ The client session supports the context manager protocol for self closing.
       .. versionadded:: 3.15
 
    :param bool trust_env: Trust environment settings for proxy configuration if the parameter
-      is ``True`` (``False`` by default). See :ref:`aiohttp-client-proxy-support` for
+      is ``True`` (``False`` by default). The proxy configuration is
+      read once, at session creation, and kept as an immutable snapshot for
+      the session's lifetime. See :ref:`aiohttp-client-proxy-support` for
       more information.
 
       Get proxy credentials from ``~/.netrc`` file if present.

@@ -8,6 +8,7 @@ import datetime
 import enum
 import functools
 import inspect
+import ipaddress
 import netrc
 import os
 import platform
@@ -39,7 +40,7 @@ from typing import (
     overload,
 )
 from urllib.parse import quote
-from urllib.request import getproxies, proxy_bypass
+from urllib.request import getproxies
 
 from multidict import CIMultiDict, MultiDict, MultiDictProxy
 from propcache.api import under_cached_property as reify
@@ -280,44 +281,189 @@ def _auth_header_from_netrc(netrc_obj: netrc.netrc | None, host: str) -> str:
     return encode_basic_auth(username, password)
 
 
-def proxies_from_env() -> dict[str, ProxyInfo]:
-    proxy_urls = {
-        k: URL(v)
-        for k, v in getproxies().items()
-        if k in ("http", "https", "ws", "wss")
-    }
-    netrc_obj = netrc_from_env()
-    stripped = {k: strip_auth_from_url(v) for k, v in proxy_urls.items()}
-    ret = {}
-    for proto, val in stripped.items():
-        proxy, auth = val
-        if proxy.scheme in ("https", "wss"):
-            client_logger.warning(
-                "%s proxies %s are not supported, ignoring", proxy.scheme.upper(), proxy
+# Default ports used to normalize no_proxy host:port tokens when the
+# target URL does not carry an explicit port.
+_DEFAULT_SCHEME_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
+
+
+def _split_no_proxy_token(token: str) -> tuple[str, int | None] | None:
+    """Split a no_proxy token into a host part and an optional port."""
+    token = token.strip()
+    if not token:
+        return None
+    port: int | None = None
+    if token.startswith("["):
+        # Bracketed IPv6 literal, optionally followed by a port.
+        host, sep, tail = token.partition("]")
+        if not sep:
+            return None
+        host = host[1:]
+        if tail:
+            if not tail.startswith(":") or not tail[1:].isdigit():
+                return None
+            port = int(tail[1:])
+    elif token.count(":") == 1:
+        # host:port; anything with more colons is a bare IPv6 literal.
+        host, _, port_part = token.partition(":")
+        if port_part.isdigit():
+            port = int(port_part)
+        elif port_part:
+            return None
+    else:
+        host = token
+    if port is not None and not 0 <= port <= 65535:
+        return None
+    return host, port
+
+
+class ProxyBypassMatcher:
+    """Immutable matcher for no_proxy/NO_PROXY rules.
+
+    Tokens are normalized by host and port so that IPv4/IPv6 literals,
+    CIDR ranges, trailing-dot domains and host:port tokens behave
+    consistently with common enterprise proxy rules:
+
+    * a bare asterisk matches every host.
+    * IPv4/IPv6 literals (optionally bracketed) match the same literal only.
+    * CIDR ranges (e.g. 10.0.0.0/8 or 2001:db8::/32) match every
+      IP address inside the range.
+    * Domain tokens match the domain itself and all of its subdomains;
+      leading and trailing dots are ignored on both the token and the
+      target host.
+    * A :port suffix restricts any of the above to targets on that
+      port (the URL's explicit port, or its scheme's default port).
+    """
+
+    __slots__ = ("_match_all", "_networks", "_domains")
+
+    def __init__(self, no_proxy: str) -> None:
+        self._match_all = False
+        networks: list[
+            tuple[int | None, ipaddress.IPv4Network | ipaddress.IPv6Network]
+        ] = []
+        domains: list[tuple[int | None, str]] = []
+        for raw_token in no_proxy.split(","):
+            parsed = _split_no_proxy_token(raw_token)
+            if parsed is None:
+                continue
+            host, port = parsed
+            if host == "*":
+                self._match_all = True
+                continue
+            host = host.lower().rstrip(".")
+            if not host:
+                continue
+            try:
+                network = ipaddress.ip_network(host, strict=False)
+            except ValueError:
+                domain = host.lstrip(".")
+                if domain:
+                    domains.append((port, domain))
+            else:
+                networks.append((port, network))
+        self._networks = tuple(networks)
+        self._domains = tuple(domains)
+
+    def matches(self, host: str, port: int | None = None) -> bool:
+        """Check whether connections to host:port must bypass proxies."""
+        if self._match_all:
+            return True
+        host = host.lower().rstrip(".")
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            ip = None
+        if ip is not None:
+            # IP literal targets only ever match IP/CIDR tokens, never
+            # domain suffixes.
+            return any(
+                (network_port is None or network_port == port) and ip in network
+                for network_port, network in self._networks
             )
-            continue
-        if netrc_obj and auth is None:
-            if proxy.host is not None:
-                try:
-                    auth = _auth_header_from_netrc(netrc_obj, proxy.host)
-                except LookupError:
-                    auth = None
-        ret[proto] = ProxyInfo(proxy, auth)
-    return ret
+        return any(
+            (domain_port is None or domain_port == port)
+            and (host == domain or host.endswith("." + domain))
+            for domain_port, domain in self._domains
+        )
+
+
+@frozen_dataclass_decorator
+class ProxyConfig:
+    """Immutable snapshot of the environment proxy configuration.
+
+    The snapshot is taken once (typically when a client session is
+    created) and may be shared safely between sessions, requests and
+    threads: every contained structure is immutable.
+    """
+
+    proxies: Mapping[str, ProxyInfo]
+    bypass: ProxyBypassMatcher
+
+    @classmethod
+    def from_env(cls) -> "ProxyConfig":
+        """Read the proxy configuration from the environment."""
+        proxies_env = getproxies()
+        proxy_urls = {
+            k: URL(v)
+            for k, v in proxies_env.items()
+            if k in ("http", "https", "ws", "wss")
+        }
+        netrc_obj = netrc_from_env()
+        stripped = {k: strip_auth_from_url(v) for k, v in proxy_urls.items()}
+        ret: dict[str, ProxyInfo] = {}
+        for proto, val in stripped.items():
+            proxy, auth = val
+            if proxy.scheme in ("https", "wss"):
+                client_logger.warning(
+                    "%s proxies %s are not supported, ignoring",
+                    proxy.scheme.upper(),
+                    proxy,
+                )
+                continue
+            if netrc_obj and auth is None:
+                if proxy.host is not None:
+                    try:
+                        auth = _auth_header_from_netrc(netrc_obj, proxy.host)
+                    except LookupError:
+                        auth = None
+            ret[proto] = ProxyInfo(proxy, auth)
+        return cls(
+            MappingProxyType(ret), ProxyBypassMatcher(proxies_env.get("no", ""))
+        )
+
+    def _bypasses(self, url: URL) -> bool:
+        if url.host is None:
+            return False
+        port = url.explicit_port or _DEFAULT_SCHEME_PORTS.get(url.scheme)
+        return self.bypass.matches(url.host, port)
+
+    def proxy_for(self, url: URL) -> ProxyInfo | None:
+        """Return the proxy to use for url or None for a direct route."""
+        if self._bypasses(url):
+            return None
+        return self.proxies.get(url.scheme)
+
+
+def proxies_from_env() -> dict[str, ProxyInfo]:
+    """Return the proxies defined in the environment.
+
+    Every call reads the environment afresh and returns a new dict, so
+    callers never share mutable proxy state.
+    """
+    return dict(ProxyConfig.from_env().proxies)
 
 
 def get_env_proxy_for_url(url: URL) -> tuple[URL, str | None]:
     """Get a permitted proxy for the given URL from the env."""
-    if url.host is not None and proxy_bypass(url.host):
-        raise LookupError(f"Proxying is disallowed for `{url.host!r}`")
-
-    proxies_in_env = proxies_from_env()
-    try:
-        proxy_info = proxies_in_env[url.scheme]
-    except KeyError:
-        raise LookupError(f"No proxies found for `{url!s}` in the env")
-    else:
+    config = ProxyConfig.from_env()
+    proxy_info = config.proxy_for(url)
+    if proxy_info is not None:
         return proxy_info.proxy, proxy_info.proxy_auth
+    if config._bypasses(url):
+        raise LookupError(f"Proxying is disallowed for `{url.host!r}`")
+    raise LookupError(f"No proxies found for `{url!s}` in the env")
 
 
 @frozen_dataclass_decorator

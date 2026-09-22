@@ -2,6 +2,7 @@ import asyncio
 import os
 import pathlib
 import platform
+import socket
 import ssl
 import sys
 from collections.abc import Awaitable, Callable, Iterator
@@ -19,6 +20,7 @@ from yarl import URL
 
 import aiohttp
 from aiohttp import ClientResponse, web
+from aiohttp.abc import AbstractResolver, ResolveResult
 from aiohttp.client import _RequestOptions
 from aiohttp.client_exceptions import ClientConnectionError
 from aiohttp.test_utils import TestServer
@@ -1058,3 +1060,320 @@ async def test_https_proxy_connect_tunnel_session_close_no_hang(
     finally:
         # Clean close
         await session.close()
+
+
+class _RecordingResolver(AbstractResolver):
+    """Fake resolver that maps every host to 127.0.0.1 and records lookups."""
+
+    def __init__(self) -> None:
+        self.queries: list[tuple[str, int]] = []
+
+    async def resolve(
+        self, host: str, port: int = 0, family: int = socket.AF_INET
+    ) -> list[ResolveResult]:
+        self.queries.append((host, port))
+        return [
+            {
+                "hostname": host,
+                "host": "127.0.0.1",
+                "port": port,
+                "family": family,
+                "proto": 0,
+                "flags": socket.AI_NUMERIC,
+            }
+        ]
+
+    async def close(self) -> None:
+        pass
+
+
+def _clear_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "http_proxy",
+        "https_proxy",
+        "ws_proxy",
+        "wss_proxy",
+        "all_proxy",
+        "no_proxy",
+    ):
+        for env_name in (name, name.upper()):
+            monkeypatch.delenv(env_name, raising=False)
+
+
+async def _start_recording_proxy(
+    aiohttp_raw_server: AiohttpRawServer, requests: list[web.Request]
+) -> URL:
+    """Start a fake proxy that records incoming requests and answers 200."""
+
+    async def handler(request: web.Request) -> web.Response:
+        requests.append(request)
+        return web.Response(status=200)
+
+    server = await aiohttp_raw_server(handler)
+    return server.make_url("/")
+
+
+@pytest.mark.parametrize(
+    ("no_proxy", "url_template", "expect_direct"),
+    (
+        # Domain tokens: exact, leading dot, subdomain and trailing dot.
+        ("", "http://routing.example:{port}/path", False),
+        ("routing.example", "http://routing.example:{port}/path", True),
+        (".routing.example", "http://routing.example:{port}/path", True),
+        ("routing.example.", "http://routing.example:{port}/path", True),
+        ("routing.example", "http://www.routing.example:{port}/path", True),
+        ("www.routing.example", "http://routing.example:{port}/path", False),
+        ("notrouting.example", "http://routing.example:{port}/path", False),
+        # Port tokens, matched against the explicit target port.
+        ("routing.example:{port}", "http://routing.example:{port}/path", True),
+        ("routing.example:1", "http://routing.example:{port}/path", False),
+        # IPv4 literal and CIDR tokens.
+        ("127.0.0.1", "http://127.0.0.1:{port}/path", True),
+        ("127.0.0.0/8", "http://127.0.0.1:{port}/path", True),
+        ("10.0.0.0/8", "http://127.0.0.1:{port}/path", False),
+        # A bare asterisk bypasses everything.
+        ("*", "http://routing.example:{port}/path", True),
+    ),
+)
+async def test_proxy_from_env_routing_decision_table(
+    no_proxy: str,
+    url_template: str,
+    expect_direct: bool,
+    proxy_test_server: Callable[[], Awaitable[mock.Mock]],
+    aiohttp_raw_server: AiohttpRawServer,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """Every NO_PROXY token kind routes to either a direct or a proxied hop."""
+    proxy = await proxy_test_server()
+    mocker.patch("pathlib.Path.is_file", mock_is_file)
+
+    origin_requests: list[web.Request] = []
+
+    async def origin_handler(request: web.Request) -> web.Response:
+        origin_requests.append(request)
+        return web.Response(text="direct")
+
+    origin = await aiohttp_raw_server(origin_handler)
+    url = url_template.format(port=origin.port)
+
+    resolver = _RecordingResolver()
+    connector = aiohttp.TCPConnector(resolver=resolver)
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("http_proxy", str(proxy.url))
+    monkeypatch.setenv("no_proxy", no_proxy.format(port=origin.port))
+
+    async with aiohttp.ClientSession(connector=connector, trust_env=True) as session:
+        async with session.get(url) as resp:
+            assert resp.status == 200
+            await resp.read()
+
+    if expect_direct:
+        # The origin server was contacted directly...
+        assert len(origin_requests) == 1
+        # ...and the recording proxy saw nothing.
+        assert proxy.requests_list == []
+        # Hostname targets were resolved by the client resolver;
+        # IP literal targets need no resolution at all.
+        host = URL(url).host
+        assert host is not None
+        if not match_regex(r"^[0-9.]+$", host):
+            assert (host, origin.port) in resolver.queries
+    else:
+        # The request went through the proxy in absolute form...
+        assert len(proxy.requests_list) == 1
+        target_host = URL(url).host
+        assert target_host is not None
+        assert proxy.requests_list[0].host == target_host
+        assert proxy.requests_list[0].path_qs == "/path"
+        # ...and the origin server was never contacted directly.
+        assert origin_requests == []
+        # The client never resolved the target host itself.
+        assert resolver.queries == []
+
+
+@pytest.mark.parametrize(
+    ("no_proxy", "expect_direct"),
+    (
+        ("", False),
+        ("routing.example", True),
+        # A port token matching the explicit CONNECT port bypasses too.
+        ("routing.example:1", True),
+        ("routing.example:2", False),
+    ),
+)
+async def test_proxy_from_env_https_connect_decision(
+    no_proxy: str,
+    expect_direct: bool,
+    proxy_test_server: Callable[[], Awaitable[mock.Mock]],
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """HTTPS targets either open a CONNECT tunnel or go direct."""
+    proxy = await proxy_test_server()
+    mocker.patch("pathlib.Path.is_file", mock_is_file)
+
+    resolver = _RecordingResolver()
+    connector = aiohttp.TCPConnector(resolver=resolver, ssl=False)
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("https_proxy", str(proxy.url))
+    monkeypatch.setenv("no_proxy", no_proxy)
+
+    # Port 1 is never listening, so a direct connection always fails fast.
+    url = "https://routing.example:1/"
+    async with aiohttp.ClientSession(connector=connector, trust_env=True) as session:
+        if expect_direct:
+            with pytest.raises(ClientConnectionError):
+                await session.get(url)
+            # The proxy was not involved at all.
+            assert proxy.requests_list == []
+            assert ("routing.example", 1) in resolver.queries
+        else:
+            with suppress(aiohttp.ClientError):
+                await session.get(url)
+            # The first recorded request is the CONNECT tunnel request.
+            assert len(proxy.requests_list) >= 1
+            connect_request = proxy.requests_list[0]
+            assert connect_request.method == "CONNECT"
+            assert connect_request.raw_path == "routing.example:1"
+            assert resolver.queries == []
+
+
+async def test_proxy_from_env_snapshot_ignores_later_env_changes(
+    aiohttp_raw_server: AiohttpRawServer,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """A session keeps using the env snapshot taken at its creation."""
+    mocker.patch("pathlib.Path.is_file", mock_is_file)
+    proxy_one_requests: list[web.Request] = []
+    proxy_two_requests: list[web.Request] = []
+    proxy_one_url = await _start_recording_proxy(aiohttp_raw_server, proxy_one_requests)
+    proxy_two_url = await _start_recording_proxy(aiohttp_raw_server, proxy_two_requests)
+
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("http_proxy", str(proxy_one_url))
+    async with aiohttp.ClientSession(trust_env=True) as session:
+        # The environment changes after the session was created...
+        monkeypatch.setenv("http_proxy", str(proxy_two_url))
+        async with session.get("http://routing.example/") as resp:
+            assert resp.status == 200
+        # ...but the session still routes via the first proxy.
+        assert len(proxy_one_requests) == 1
+        assert proxy_two_requests == []
+
+    # A session created after the change picks up the new environment.
+    async with aiohttp.ClientSession(trust_env=True) as session2:
+        async with session2.get("http://routing.example/") as resp:
+            assert resp.status == 200
+    assert len(proxy_one_requests) == 1
+    assert len(proxy_two_requests) == 1
+
+
+async def test_per_request_proxy_overrides_env_without_leaking_auth(
+    aiohttp_raw_server: AiohttpRawServer,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """A per-request proxy wins over the env and gets no env-proxy auth."""
+    mocker.patch("pathlib.Path.is_file", mock_is_file)
+    env_proxy_requests: list[web.Request] = []
+    explicit_proxy_requests: list[web.Request] = []
+    env_proxy_url = await _start_recording_proxy(aiohttp_raw_server, env_proxy_requests)
+    explicit_proxy_url = await _start_recording_proxy(
+        aiohttp_raw_server, explicit_proxy_requests
+    )
+
+    _clear_proxy_env(monkeypatch)
+    env_proxy_with_auth = (
+        URL(str(env_proxy_url)).with_user("user").with_password("pass")
+    )
+    monkeypatch.setenv("http_proxy", str(env_proxy_with_auth))
+    async with aiohttp.ClientSession(trust_env=True) as session:
+        async with session.get(
+            "http://routing.example/", proxy=str(explicit_proxy_url)
+        ) as resp:
+            assert resp.status == 200
+
+    # The env proxy was bypassed entirely...
+    assert env_proxy_requests == []
+    # ...and its credentials were not leaked to the explicit proxy.
+    assert len(explicit_proxy_requests) == 1
+    assert "Proxy-Authorization" not in explicit_proxy_requests[0].headers
+
+
+async def test_redirect_reevaluates_no_proxy_per_hop(
+    proxy_test_server: Callable[[], Awaitable[mock.Mock]],
+    aiohttp_raw_server: AiohttpRawServer,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """A redirect to a NO_PROXY host leaves the proxy for the next hop."""
+    proxy = await proxy_test_server()
+    mocker.patch("pathlib.Path.is_file", mock_is_file)
+
+    origin_requests: list[web.Request] = []
+
+    async def origin_handler(request: web.Request) -> web.Response:
+        origin_requests.append(request)
+        return web.Response(text="final")
+
+    origin = await aiohttp_raw_server(origin_handler)
+    # The first hop is proxied and redirects to a bypassed host.
+    proxy.return_value = {
+        "status": 302,
+        "headers": {"Location": f"http://bypass.example:{origin.port}/final"},
+    }
+
+    resolver = _RecordingResolver()
+    connector = aiohttp.TCPConnector(resolver=resolver)
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("http_proxy", str(proxy.url))
+    monkeypatch.setenv("no_proxy", "bypass.example")
+
+    async with aiohttp.ClientSession(connector=connector, trust_env=True) as session:
+        async with session.get("http://routing.example/start") as resp:
+            assert resp.status == 200
+            assert await resp.text() == "final"
+
+    # The first hop went through the proxy...
+    assert len(proxy.requests_list) == 1
+    # ...while the redirect target was fetched directly.
+    assert len(origin_requests) == 1
+    assert ("bypass.example", origin.port) in resolver.queries
+
+
+async def test_proxy_from_env_not_used_for_unix_socket(
+    unix_sockname: str,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """Unix socket connectors always connect directly, ignoring env proxies."""
+    mocker.patch("pathlib.Path.is_file", mock_is_file)
+    seen_paths: list[str] = []
+
+    async def handler(request: web.Request) -> web.Response:
+        seen_paths.append(request.raw_path)
+        return web.Response(text="ok")
+
+    app = web.Application()
+    app.router.add_get("/path", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.UnixSite(runner, unix_sockname)
+    await site.start()
+    try:
+        _clear_proxy_env(monkeypatch)
+        # If the env proxy were applied, the request would be sent to an
+        # unresolvable proxy host in absolute form; it must not be.
+        monkeypatch.setenv("http_proxy", "http://proxy.invalid:8080")
+        async with aiohttp.ClientSession(
+            connector=aiohttp.UnixConnector(unix_sockname), trust_env=True
+        ) as session:
+            async with session.get("http://localhost/path") as resp:
+                assert resp.status == 200
+                assert await resp.text() == "ok"
+        # The request reached the unix socket in origin form.
+        assert seen_paths == ["/path"]
+    finally:
+        await runner.cleanup()

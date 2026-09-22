@@ -1,0 +1,12 @@
+Unified proxy route selection across ``proxies_from_env``,
+``ClientSession`` and connectors: ``NO_PROXY`` tokens are now
+normalized by scheme/host/port, with support for IPv4/IPv6 literals, CIDR
+ranges, trailing-dot domains and ``host:port`` entries
+-- by :user:`aio-libs`.
+
+When ``trust_env=True``, the environment proxy configuration is
+snapshotted once at ``ClientSession`` creation into an immutable
+``ProxyConfig``, so concurrent sessions and threads never share mutable
+proxy state; a per-request ``proxy`` still overrides the environment
+without leaking the environment proxy's credentials, and Unix socket /
+named pipe connectors always connect directly.

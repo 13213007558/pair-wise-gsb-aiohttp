@@ -1729,3 +1729,81 @@ async def test_netrc_auth_host_not_in_netrc(auth_server: TestServer) -> None:
         text = await resp.text()
         # Should not have auth since the host is not in netrc
         assert text == "no_auth"
+
+
+def _clear_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "http_proxy",
+        "https_proxy",
+        "ws_proxy",
+        "wss_proxy",
+        "no_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "WS_PROXY",
+        "WSS_PROXY",
+        "NO_PROXY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+async def test_env_proxy_snapshot_taken_at_session_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The env proxy config is snapshotted once, at session creation."""
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("http_proxy", "http://proxy.one:8080")
+    monkeypatch.setenv("no_proxy", "internal.example")
+    async with ClientSession(trust_env=True) as session:
+        # Changing the environment after creation must not affect the
+        # routing decisions of the existing session.
+        monkeypatch.setenv("http_proxy", "http://proxy.two:8080")
+        monkeypatch.setenv("no_proxy", "")
+        config = session._env_proxy_config
+        assert config is not None
+        proxy_info = config.proxy_for(URL("http://example.com/"))
+        assert proxy_info is not None
+        assert proxy_info.proxy == URL("http://proxy.one:8080")
+        assert config.proxy_for(URL("http://internal.example/")) is None
+
+    # A new session picks up the new environment.
+    async with ClientSession(trust_env=True) as session2:
+        config2 = session2._env_proxy_config
+        assert config2 is not None
+        proxy_info2 = config2.proxy_for(URL("http://example.com/"))
+        assert proxy_info2 is not None
+        assert proxy_info2.proxy == URL("http://proxy.two:8080")
+        assert config2.proxy_for(URL("http://internal.example/")) is not None
+
+
+async def test_env_proxy_config_absent_without_trust_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No proxy state is tracked when trust_env is disabled."""
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("http_proxy", "http://proxy.one:8080")
+    async with ClientSession() as session:
+        assert session._env_proxy_config is None
+
+
+async def test_sessions_do_not_share_mutable_proxy_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each session owns an independent, immutable proxy configuration."""
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("http_proxy", "http://proxy.one:8080")
+    async with ClientSession(trust_env=True) as session1:
+        monkeypatch.setenv("http_proxy", "http://proxy.two:8080")
+        async with ClientSession(trust_env=True) as session2:
+            config1 = session1._env_proxy_config
+            config2 = session2._env_proxy_config
+            assert config1 is not None and config2 is not None
+            assert config1 is not config2
+            assert config1.proxies is not config2.proxies
+            assert isinstance(config1.proxies, MappingProxyType)
+            with pytest.raises(TypeError):
+                config1.proxies["http"] = config2.proxies["http"]  # type: ignore[index]
+            # The first session still routes via the first proxy.
+            proxy_info = config1.proxy_for(URL("http://example.com/"))
+            assert proxy_info is not None
+            assert proxy_info.proxy == URL("http://proxy.one:8080")

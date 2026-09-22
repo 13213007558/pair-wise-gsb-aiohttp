@@ -778,6 +778,176 @@ def test_get_env_proxy_for_url(proxy_env_vars: dict[str, str], url_input: str) -
     assert proxy_auth is None
 
 
+# --------------------- ProxyBypassMatcher ------------------------------
+
+
+@pytest.mark.parametrize(
+    ("no_proxy", "host", "port", "expected"),
+    (
+        # Domain tokens match the domain itself and its subdomains.
+        ("example.com", "example.com", None, True),
+        ("example.com", "www.example.com", None, True),
+        ("example.com", "deep.www.example.com", None, True),
+        ("example.com", "notexample.com", None, False),
+        ("example.com", "example.com.evil.com", None, False),
+        ("example.com", "com", None, False),
+        # A leading dot on the token is equivalent to no dot.
+        (".example.com", "example.com", None, True),
+        (".example.com", "www.example.com", None, True),
+        # Trailing dots are normalized away on both sides.
+        ("example.com.", "example.com", None, True),
+        ("example.com.", "www.example.com.", None, True),
+        ("example.com", "example.com.", None, True),
+        ("example.com", "www.EXAMPLE.com", None, True),
+        # Case is normalized on both sides.
+        ("EXAMPLE.COM", "www.example.com", None, True),
+        # IPv4 literals match exactly.
+        ("10.0.0.1", "10.0.0.1", None, True),
+        ("10.0.0.1", "10.0.0.2", None, False),
+        ("10.0.0.1", "www.10.0.0.1", None, False),
+        # IPv4 CIDR ranges.
+        ("10.0.0.0/8", "10.1.2.3", None, True),
+        ("10.0.0.0/8", "10.255.255.255", None, True),
+        ("10.0.0.0/8", "11.0.0.1", None, False),
+        ("192.168.0.0/24", "192.168.0.1", None, True),
+        ("192.168.0.0/24", "192.168.1.1", None, False),
+        # Host bits set in the token are normalized to the network.
+        ("10.1.2.3/8", "10.9.8.7", None, True),
+        # IPv6 literals, with and without brackets.
+        ("::1", "::1", None, True),
+        ("[::1]", "::1", None, True),
+        ("::1", "[::1]", None, True),
+        ("[::1]", "[::1]", None, True),
+        ("::1", "::2", None, False),
+        ("2001:db8::1", "2001:db8::1", None, True),
+        ("2001:db8::1", "2001:db8::2", None, False),
+        # IPv6 CIDR ranges.
+        ("2001:db8::/32", "2001:db8::1", None, True),
+        ("2001:db8::/32", "2001:db8:ffff::1", None, True),
+        ("2001:db8::/32", "2001:db9::1", None, False),
+        ("::1/128", "::1", None, True),
+        ("::1/128", "::2", None, False),
+        # IPv4 targets never match IPv6 ranges and vice versa.
+        ("10.0.0.0/8", "::ffff:10.1.2.3", None, False),
+        ("::/0", "10.1.2.3", None, False),
+        ("0.0.0.0/0", "::1", None, False),
+        # Port tokens restrict the match to that port.
+        ("example.com:8080", "example.com", 8080, True),
+        ("example.com:8080", "www.example.com", 8080, True),
+        ("example.com:8080", "example.com", 80, False),
+        ("example.com:8080", "example.com", None, False),
+        ("10.0.0.1:8080", "10.0.0.1", 8080, True),
+        ("10.0.0.1:8080", "10.0.0.1", 80, False),
+        ("10.0.0.0/8:8080", "10.1.2.3", 8080, True),
+        ("10.0.0.0/8:8080", "10.1.2.3", 80, False),
+        ("[::1]:8080", "::1", 8080, True),
+        ("[::1]:8080", "::1", 8081, False),
+        ("[::1]:8080", "::1", None, False),
+        # A bare asterisk matches everything.
+        ("*", "example.com", None, True),
+        ("*", "10.0.0.1", 8080, True),
+        ("*", "::1", None, True),
+        # An IP target never matches a domain suffix token, even when the
+        # token is a suffix of the literal's text.
+        ("0.0.1", "10.0.0.1", None, False),
+        ("1.2.3.4.5", "1.2.3.4", None, False),
+        # Multiple tokens, whitespace and empty entries.
+        ("example.com, 10.0.0.0/8", "10.1.1.1", None, True),
+        (" example.com , , proxy.io ", "proxy.io", None, True),
+        ("", "example.com", None, False),
+        ("  ", "example.com", None, False),
+        (",,,", "example.com", None, False),
+        # Invalid tokens are ignored.
+        ("example.com:http", "example.com", 80, False),
+        ("example.com:99999", "example.com", 99999, False),
+        ("[::1", "::1", None, False),
+        # Not a valid IP literal, so both sides fall back to domain rules.
+        ("999.999.999.999", "999.999.999.999", None, True),
+        ("10.0.0.0/33", "10.0.0.1", None, False),
+    ),
+)
+def test_proxy_bypass_matcher(
+    no_proxy: str, host: str, port: int | None, expected: bool
+) -> None:
+    matcher = helpers.ProxyBypassMatcher(no_proxy)
+    assert matcher.matches(host, port) is expected
+
+
+# --------------------- ProxyConfig ------------------------------
+
+
+@pytest.fixture
+def proxy_routing_env(monkeypatch: pytest.MonkeyPatch, no_proxy_token: str) -> None:
+    """Set http/https proxies plus a single parametrized NO_PROXY token."""
+    for schema in getproxies_environment().keys():
+        monkeypatch.delenv(f"{schema}_proxy", False)
+    monkeypatch.setenv("http_proxy", "http://proxy.example")
+    monkeypatch.setenv("https_proxy", "http://proxy.example")
+    monkeypatch.setenv("no_proxy", no_proxy_token)
+
+
+@pytest.mark.parametrize(
+    ("no_proxy_token", "url_input", "expected_proxy"),
+    (
+        # Every NO_PROXY token kind routes to either direct or proxied.
+        ("aiohttp.io", "http://aiohttp.io/", None),
+        ("aiohttp.io", "http://www.aiohttp.io/", None),
+        ("aiohttp.io.", "http://aiohttp.io./", None),
+        ("aiohttp.io", "http://other.io/", "http://proxy.example"),
+        ("10.0.0.0/8", "http://10.1.2.3/", None),
+        ("10.0.0.0/8", "http://11.0.0.1/", "http://proxy.example"),
+        ("127.0.0.1", "http://127.0.0.1/", None),
+        ("[::1]", "http://[::1]/", None),
+        ("2001:db8::/32", "http://[2001:db8::1]/", None),
+        ("2001:db8::/32", "http://[2001:db9::1]/", "http://proxy.example"),
+        # Port tokens are normalized against the scheme default port.
+        ("aiohttp.io:80", "http://aiohttp.io/", None),
+        ("aiohttp.io:80", "http://aiohttp.io:80/", None),
+        ("aiohttp.io:80", "http://aiohttp.io:8080/", "http://proxy.example"),
+        ("aiohttp.io:443", "https://aiohttp.io/", None),
+        ("aiohttp.io:443", "http://aiohttp.io/", "http://proxy.example"),
+        ("*", "http://aiohttp.io/", None),
+    ),
+)
+@pytest.mark.usefixtures("proxy_routing_env")
+def test_proxy_config_proxy_for_routing_table(
+    no_proxy_token: str, url_input: str, expected_proxy: str | None
+) -> None:
+    config = helpers.ProxyConfig.from_env()
+    proxy_info = config.proxy_for(URL(url_input))
+    if expected_proxy is None:
+        assert proxy_info is None
+    else:
+        assert proxy_info is not None
+        assert proxy_info.proxy == URL(expected_proxy)
+
+
+def test_proxy_config_proxies_immutable(
+    proxy_env_vars_immutable: None,
+) -> None:
+    config = helpers.ProxyConfig.from_env()
+    assert isinstance(config.proxies, MappingProxyType)
+    with pytest.raises(TypeError):
+        config.proxies["http"] = helpers.ProxyInfo(  # type: ignore[index]
+            URL("http://x"), None
+        )
+
+
+@pytest.fixture
+def proxy_env_vars_immutable(monkeypatch: pytest.MonkeyPatch) -> None:
+    for schema in getproxies_environment().keys():
+        monkeypatch.delenv(f"{schema}_proxy", False)
+    monkeypatch.setenv("http_proxy", "http://proxy.example")
+
+
+def test_proxies_from_env_returns_fresh_dict(
+    proxy_env_vars_immutable: None,
+) -> None:
+    first = helpers.proxies_from_env()
+    first["http"] = helpers.ProxyInfo(URL("http://tampered"), None)
+    first.pop("http")
+    second = helpers.proxies_from_env()
+    assert second["http"].proxy == URL("http://proxy.example")
 # ------------- set_result / set_exception ----------------------
 
 

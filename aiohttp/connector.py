@@ -325,6 +325,10 @@ class BaseConnector:
 
     allowed_protocol_schema_set = HIGH_LEVEL_SCHEMA_SET
 
+    #: Whether requests made through this connector may be routed
+    #: through an HTTP proxy (e.g. one selected from the environment).
+    supports_proxy = True
+
     def __init__(
         self,
         *,
@@ -1687,6 +1691,9 @@ class UnixConnector(BaseConnector):
 
     allowed_protocol_schema_set = HIGH_LEVEL_SCHEMA_SET | frozenset({"unix"})
 
+    #: Unix socket connections are always direct, never proxied.
+    supports_proxy = False
+
     def __init__(
         self,
         path: str,
@@ -1742,6 +1749,9 @@ class NamedPipeConnector(BaseConnector):
     """
 
     allowed_protocol_schema_set = HIGH_LEVEL_SCHEMA_SET | frozenset({"npipe"})
+
+    #: Named pipe connections are always direct, never proxied.
+    supports_proxy = False
 
     def __init__(
         self,
