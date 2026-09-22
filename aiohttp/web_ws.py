@@ -4,19 +4,18 @@ import binascii
 import hashlib
 import json
 import sys
-from asyncio.base_events import BaseEventLoop
 from collections.abc import Callable, Iterable
 from typing import Any, Final, Generic, Literal, Union, overload
 
 from multidict import CIMultiDict
 
 from . import hdrs
+from ._websocket.base import WebSocketBase
 from ._websocket.reader import WebSocketDataQueue
 from .abc import AbstractStreamWriter
 from .client_exceptions import WSMessageTypeError
 from .helpers import (
     DEFAULT_CHUNK_SIZE,
-    calculate_timeout_when,
     frozen_dataclass_decorator,
     set_exception,
     set_result,
@@ -76,27 +75,12 @@ class WebSocketReady:
         return self.ok
 
 
-class WebSocketResponse(StreamResponse, Generic[_DecodeText]):
+class WebSocketResponse(StreamResponse, WebSocketBase, Generic[_DecodeText]):
 
     _length_check: bool = False
     _ws_protocol: str | None = None
-    _writer: WebSocketWriter | None = None
-    _reader: WebSocketDataQueue | None = None
     _parser: WebSocketReader | None = None
-    _closed: bool = False
-    _closing: bool = False
     _conn_lost: int = 0
-    _close_code: int | None = None
-    _loop: asyncio.AbstractEventLoop | None = None
-    _waiting: bool = False
-    _close_wait: asyncio.Future[None] | None = None
-    _exception: BaseException | None = None
-    _heartbeat_when: float = 0.0
-    _heartbeat_cb: asyncio.TimerHandle | None = None
-    _pong_response_cb: asyncio.TimerHandle | None = None
-    _ping_task: asyncio.Task[None] | None = None
-    _need_heartbeat_reset: bool = False
-    _heartbeat_reset_handle: asyncio.Handle | None = None
 
     def __init__(
         self,
@@ -118,150 +102,28 @@ class WebSocketResponse(StreamResponse, Generic[_DecodeText]):
         self._receive_timeout = receive_timeout
         self._autoclose = autoclose
         self._autoping = autoping
-        self._heartbeat = heartbeat
-        if heartbeat is not None:
-            self._pong_heartbeat = heartbeat / 2.0
+        self._init_heartbeat(heartbeat)
         self._compress: bool | int = compress
         self._max_msg_size = max_msg_size
         self._writer_limit = writer_limit
         self._decode_text = decode_text
-        self._need_heartbeat_reset = False
-        self._heartbeat_reset_handle = None
 
-    def _cancel_heartbeat(self) -> None:
-        self._cancel_pong_response_cb()
-        if self._heartbeat_reset_handle is not None:
-            self._heartbeat_reset_handle.cancel()
-            self._heartbeat_reset_handle = None
-        self._need_heartbeat_reset = False
-        if self._heartbeat_cb is not None:
-            self._heartbeat_cb.cancel()
-            self._heartbeat_cb = None
-        if self._ping_task is not None:
-            self._ping_task.cancel()
-            self._ping_task = None
-
-    def _cancel_pong_response_cb(self) -> None:
-        if self._pong_response_cb is not None:
-            self._pong_response_cb.cancel()
-            self._pong_response_cb = None
-
-    def _on_data_received(self) -> None:
-        if self._heartbeat is None or self._need_heartbeat_reset:
-            return
-        loop = self._loop
-        assert loop is not None
-        # Coalesce multiple chunks received in the same loop tick into a single
-        # heartbeat reset. Resetting immediately per chunk increases timer churn.
-        self._need_heartbeat_reset = True
-        self._heartbeat_reset_handle = loop.call_soon(self._flush_heartbeat_reset)
-
-    def _flush_heartbeat_reset(self) -> None:
-        self._heartbeat_reset_handle = None
-        if not self._need_heartbeat_reset:
-            return
-        self._reset_heartbeat()
-        self._need_heartbeat_reset = False
-
-    def _reset_heartbeat(self) -> None:
-        if self._heartbeat is None:
-            return
-        self._cancel_pong_response_cb()
+    @property
+    def _timeout_ceil_threshold(self) -> float:
         req = self._req
-        timeout_ceil_threshold = (
-            req._protocol._timeout_ceil_threshold if req is not None else 5
+        return req._protocol._timeout_ceil_threshold if req is not None else 5
+
+    @property
+    def _transport_available(self) -> bool:
+        return self._req is not None and self._req.transport is not None
+
+    def _pong_timeout_error(self) -> BaseException:
+        return asyncio.TimeoutError(
+            f"No PONG received after {self._pong_heartbeat} seconds"
         )
-        loop = self._loop
-        assert loop is not None
-        now = loop.time()
-        when = calculate_timeout_when(now, self._heartbeat, timeout_ceil_threshold)
-        self._heartbeat_when = when
-        if self._heartbeat_cb is None:
-            # We do not cancel the previous heartbeat_cb here because
-            # it generates a significant amount of TimerHandle churn
-            # which causes asyncio to rebuild the heap frequently.
-            # Instead _send_heartbeat() will reschedule the next
-            # heartbeat if it fires too early.
-            self._heartbeat_cb = loop.call_at(when, self._send_heartbeat)
 
-    def _send_heartbeat(self) -> None:
-        self._heartbeat_cb = None
-
-        # If heartbeat reset is pending (data is being received), skip sending
-        # the ping and let the reset callback handle rescheduling the heartbeat.
-        if self._need_heartbeat_reset:
-            return
-
-        loop = self._loop
-        assert loop is not None and self._writer is not None
-        now = loop.time()
-        if now < self._heartbeat_when:
-            # Heartbeat fired too early, reschedule
-            self._heartbeat_cb = loop.call_at(
-                self._heartbeat_when, self._send_heartbeat
-            )
-            return
-
-        req = self._req
-        timeout_ceil_threshold = (
-            req._protocol._timeout_ceil_threshold if req is not None else 5
-        )
-        when = calculate_timeout_when(now, self._pong_heartbeat, timeout_ceil_threshold)
-        self._cancel_pong_response_cb()
-        self._pong_response_cb = loop.call_at(when, self._pong_not_received)
-
-        coro = self._writer.send_frame(b"", WSMsgType.PING)
-        if sys.version_info >= (3, 14):
-            # Try to send the ping immediately to avoid having to schedule
-            # the task on the event loop.
-            if isinstance(loop, BaseEventLoop):
-                ping_task = asyncio.create_task(coro, eager_start=True)
-            else:
-                ping_task = asyncio.Task(coro, loop=loop, eager_start=True)
-        elif sys.version_info >= (3, 12):
-            ping_task = asyncio.Task(coro, loop=loop, eager_start=True)
-        else:
-            ping_task = asyncio.create_task(coro)
-
-        if not ping_task.done():
-            self._ping_task = ping_task
-            ping_task.add_done_callback(self._ping_task_done)
-        else:
-            self._ping_task_done(ping_task)
-
-    def _ping_task_done(self, task: "asyncio.Task[None]") -> None:
-        """Callback for when the ping task completes."""
-        if not task.cancelled() and (exc := task.exception()):
-            self._handle_ping_pong_exception(exc)
-        self._ping_task = None
-
-    def _pong_not_received(self) -> None:
-        if self._req is not None and self._req.transport is not None:
-            self._handle_ping_pong_exception(
-                asyncio.TimeoutError(
-                    f"No PONG received after {self._pong_heartbeat} seconds"
-                )
-            )
-
-    def _handle_ping_pong_exception(self, exc: BaseException) -> None:
-        """Handle exceptions raised during ping/pong processing."""
-        if self._closed:
-            return
-        self._set_closed()
-        # close() is never reached after this; release the parser here.
-        self._parser = None
-        self._set_code_close_transport(WSCloseCode.ABNORMAL_CLOSURE)
-        self._exception = exc
-        if self._waiting and not self._closing and self._reader is not None:
-            self._reader.feed_data(WSMessageError(data=exc, extra=None))
-
-    def _set_closed(self) -> None:
-        """Set the connection to closed.
-
-        Cancel any heartbeat timers and set the closed flag.
-        """
-        self._closed = True
-        self._cancel_heartbeat()
+    def _abort_transport(self) -> None:
+        self._close_transport()
 
     async def prepare(self, request: BaseRequest) -> AbstractStreamWriter:
         # make pre-check to don't hide it by do_handshake() exceptions
@@ -539,7 +401,8 @@ class WebSocketResponse(StreamResponse, Generic[_DecodeText]):
                 self._set_code_close_transport(WSCloseCode.ABNORMAL_CLOSURE)
                 raise
             except Exception as exc:
-                self._exception = exc
+                if self._exception is None:
+                    self._exception = exc
                 self._set_code_close_transport(WSCloseCode.ABNORMAL_CLOSURE)
                 return True
 
@@ -569,19 +432,14 @@ class WebSocketResponse(StreamResponse, Generic[_DecodeText]):
                 self._set_code_close_transport(WSCloseCode.ABNORMAL_CLOSURE)
                 raise
             except Exception as exc:
-                self._exception = exc
+                if self._exception is None:
+                    self._exception = exc
                 self._set_code_close_transport(WSCloseCode.ABNORMAL_CLOSURE)
                 return True
         finally:
             # Once closed the response can no longer be drained; release the
             # parser and the stash it retains.
             self._parser = None
-
-    def _set_closing(self, code: int) -> None:
-        """Set the close code and mark the connection as closing."""
-        self._closing = True
-        self._close_code = code
-        self._cancel_heartbeat()
 
     def _set_code_close_transport(self, code: int) -> None:
         """Set the close code and close the transport."""
@@ -646,7 +504,11 @@ class WebSocketResponse(StreamResponse, Generic[_DecodeText]):
             except asyncio.TimeoutError:
                 raise
             except EofStream:
-                self._close_code = WSCloseCode.OK
+                # Do not clobber a close code that was already recorded
+                # (e.g. a pong timeout that beat the EOF to the terminal
+                # state); the first terminal event wins.
+                if self._close_code is None:
+                    self._close_code = WSCloseCode.OK
                 await self.close()
                 return WS_CLOSED_MESSAGE
             except WebSocketError as exc:
