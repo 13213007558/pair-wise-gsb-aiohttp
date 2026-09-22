@@ -1,0 +1,9 @@
+Enforced ``max_field_size`` in the pure-Python HTTP parser on header lines
+and fragments that complete in a later ``feed_data()`` call -- previously
+the per-field limit was only applied within a single TCP segment, so an
+oversized header line dribbled across multiple segments was measured
+against ``max_line_size`` instead -- and marked responses whose
+``Transfer-Encoding`` final coding is not ``chunked`` as
+``should_close``, since such bodies are delimited by the connection
+closing (:rfc:`9112` section 6.3), matching the llhttp-based parser
+-- by :user:`aio-libs`.

@@ -344,7 +344,11 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
         data_len = len(data)
         start_pos = 0
         loop = self.loop
-        max_line_length = self.max_line_size
+        # A non-empty _lines means a previous fragment ended mid-message:
+        # the start line was already consumed, so buffered and incoming
+        # lines are header fields and must be measured against
+        # max_field_size, not max_line_size.
+        max_line_length = self.max_field_size if self._lines else self.max_line_size
 
         should_close = False
         while start_pos < data_len or self._payload_has_more_data:
@@ -395,6 +399,9 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
                             msg: _MsgT = self.parse_message(self._lines)
                         finally:
                             self._lines.clear()
+                        # The next line read is the start line of the
+                        # following (pipelined) message, not a header.
+                        max_line_length = self.max_line_size
 
                         def get_content_length() -> int | None:
                             # payload length
@@ -526,8 +533,8 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
                     # bytes get appended to this line and leak in the error.
                     if b"\n" in self._tail:
                         raise BadHttpMessage("Bad line ending, expected CRLF")
-                    if len(self._tail) > self.max_line_size:
-                        raise LineTooLong(self._tail[:100] + b"...", self.max_line_size)
+                    if len(self._tail) > max_line_length:
+                        raise LineTooLong(self._tail[:100] + b"...", max_line_length)
                     data = EMPTY
                     break
 
@@ -827,10 +834,13 @@ class HttpResponseParser(HttpParser[RawResponseMessage]):
             # https://www.rfc-editor.org/rfc/rfc9112.html#name-message-body-length
             elif 100 <= status_i < 200 or status_i in {204, 304}:
                 close = False
-            elif hdrs.CONTENT_LENGTH in headers or hdrs.TRANSFER_ENCODING in headers:
+            elif chunked or hdrs.CONTENT_LENGTH in headers:
                 close = False
             else:
                 # https://www.rfc-editor.org/rfc/rfc9112.html#section-6.3-2.8
+                # Also reached when Transfer-Encoding is present but the
+                # final coding is not chunked: the body is then delimited
+                # by the connection closing, so keep-alive is impossible.
                 close = True
 
         return RawResponseMessage(

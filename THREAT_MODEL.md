@@ -268,9 +268,38 @@ into `StreamReader`) is then handed to `web_protocol.RequestHandler` and
 | 1.9 | Chunk-size DoS | The parser doesn't cap chunk size, but **server-side body length is bounded by `client_max_size` (default `1 MiB`)** in `web_request.py:BaseRequest.read`. Client-side responses are bounded by user-supplied `max_body_size` / streaming reads. | None. If a cap is ever needed at the parser level, plumb it through `HttpPayloadParser`. |
 | 1.10 | Chunk-extension DoS | Chunk-extension content is bounded by the same wire-level size constraints (it shares the chunk-size line with `max_line_size`). | **Add an explicit test that chunk-extension flooding cannot blow past `max_line_size`.** |
 | 1.11 | Parser error reflection | `http_parser.py` truncates to `[:100]` only for `LineTooLong`; `BadStatusLine` / `InvalidHeader` / `TransferEncodingError` carry the offending line up to `max_line_size` / `max_field_size`. `_http_parser.pyx` bounds its snippet to 50 bytes either side of the error position, so input with no CRLF to delimit the offending line is not quoted in full (`test_c_parser_error_message_bounded_for_crlf_free_input`). | **Audit any aiohttp path where `BadHttpMessage` content is reflected to the client unsanitised.** **User**: Review custom `web_log` configurations and any middleware that reflects parser exception messages back to the peer. |
-| 1.12 | Cython ⇄ pure-Python divergence | `tests/test_http_parser.py` parameterises tests over `REQUEST_PARSERS` / `RESPONSE_PARSERS` (pure-Python always; Cython when the extension imports). The high-leverage attack vectors are already covered under both backends: CL+TE (`test_content_length_transfer_encoding`), CL×N (`test_duplicate_singleton_header_rejected`), obs-fold (`test_reject_obsolete_line_folding`, `test_http_response_parser_obs_line_folding*`), CR/LF/NUL (`test_bad_headers`, `test_http_response_parser_null_byte_in_header_value`, `test_http_response_parser_bad_crlf`), version regex (`test_http_request_parser_bad_version*`, `test_http_response_parser_bad_version*`), bare-LF line endings (`test_reject_bare_lf_no_cross_request_leak`), control characters in the request target (`test_http_request_parser_ctl_in_request_target`). | None. When new attack vectors emerge, add them to the parameterised tests. |
+| 1.12 | Cython ⇄ pure-Python divergence | `tests/test_http_parser.py` parameterises tests over `REQUEST_PARSERS` / `RESPONSE_PARSERS` (pure-Python always; Cython when the extension imports). The high-leverage attack vectors are already covered under both backends: CL+TE (`test_content_length_transfer_encoding`), CL×N (`test_duplicate_singleton_header_rejected`), obs-fold (`test_reject_obsolete_line_folding`, `test_http_response_parser_obs_line_folding*`), CR/LF/NUL (`test_bad_headers`, `test_http_response_parser_null_byte_in_header_value`, `test_http_response_parser_bad_crlf`), version regex (`test_http_request_parser_bad_version*`, `test_http_response_parser_bad_version*`), bare-LF line endings (`test_reject_bare_lf_no_cross_request_leak`), control characters in the request target (`test_http_request_parser_ctl_in_request_target`), fragmented header-line limits (`test_max_field_size_fragmented_header_*`), EOF-delimited response framing (`test_http_response_parser_te_*_close`). | None. When new attack vectors emerge, add them to the parameterised tests. |
 | 1.13 | llhttp version drift | Manual upgrade via `make generate-llhttp`; vendor pinned in `vendor/llhttp/package.json`. | Track upstream releases (e.g. via Dependabot rule for `vendor/llhttp/package.json`), bump on every llhttp release, regenerate in CI. |
 | 1.14 | npm-side compromise of `llhttp` | The vendored output is checked into git, so a compromise during a future regen would be detectable in PR review. See [§5.19](#519-build--release-supply-chain). | **Make the llhttp build reproducible: pin Node.js version, commit the npm lockfile, and on every bump verify the regenerated C against upstream's release tarballs before committing.** |
+
+**Violation → exception → connection action (state table).**
+
+Every over-limit or malformed-field condition maps to exactly one exception
+class and one connection action. On the server, `web_protocol` answers a
+single 400 and force-closes; on the client, `client_proto` sets the
+exception on the in-flight response and closes the connection. In both
+cases the payload already fed to the application is poisoned via
+`StreamReader.set_exception`, so partially parsed bodies are never
+delivered as if valid, and buffered pipelined bytes are discarded with the
+connection rather than re-parsed.
+
+| Wire condition | Exception | Connection action |
+| :--- | :--- | :--- |
+| Start line longer than `max_line_size` (including accumulated across fragments) | `LineTooLong` | 400 (server) / exception (client), then close |
+| Header field line longer than `max_field_size` (including fragments completed by a later `feed_data`) | `LineTooLong` | 400 / exception, then close |
+| More than `max_headers` header (or trailer) lines | `BadHttpMessage` | 400 / exception, then close |
+| Duplicate singleton header (strict request parser) | `BadHttpMessage` | 400, then close |
+| Duplicate / conflicting `Content-Length` (lax response parser) | `InvalidHeader` | exception, then close |
+| `Content-Length` combined with `Transfer-Encoding` | `BadHttpMessage` | 400 / exception, then close |
+| `Transfer-Encoding` with non-final or duplicated `chunked` (request) | `BadHttpMessage` | 400, then close |
+| obs-fold continuation line (strict mode; lax mode folds with a cumulative `max_field_size` cap) | `InvalidHeader` | 400 / exception, then close |
+| Forbidden CTL in field value, non-token field name | `InvalidHeader` | 400 / exception, then close |
+| Bare `LF` where `CRLF` is required (request line, headers, chunk-size, trailers) | `BadHttpMessage` / `TransferEncodingError` | 400 / exception, then close |
+| Bad chunk-size, `LF` in chunk-extension, missing CRLF after chunk data | `TransferEncodingError` | payload poisoned, then close |
+| EOF before `Content-Length` body complete | `ContentLengthError` | payload poisoned, connection already closed |
+| EOF inside chunked body | `TransferEncodingError` | payload poisoned, connection already closed |
+| Response `Transfer-Encoding` whose final coding is not `chunked` | none (legal) | body read until EOF; `should_close` is `True`, no keep-alive reuse |
+| Upgrade (`101` / `Connection: upgrade`) with a body | none (legal) | upgrade deferred until the body is fully consumed, then the connection leaves HTTP parsing |
 
 **Past advisories / hardening (recap).**
 
@@ -331,6 +360,20 @@ into `StreamReader`) is then handed to `web_protocol.RequestHandler` and
   Now rejected at the point it is seen, matching llhttp (request line,
   headers, chunk-size, trailers). Not a vulnerability because no proxy would
   pipeline requests from multiple clients and forward raw LFs to the backend.
+- **PR #13753** — the pure-Python parser measured header lines against
+  `max_line_size` instead of `max_field_size` whenever a header line
+  was completed (or still buffered) in a later `feed_data` call than the
+  start line, so deployments using a `max_field_size` smaller than
+  `max_line_size` did not get the per-field cap on fragmented input.
+  The limit is now selected from the parser state on every fragment,
+  mirroring the fix for the Cython side (CVE-2026-54277 above).
+- **PR #13753** — the pure-Python response parser reported
+  `should_close=False` for responses whose `Transfer-Encoding` final
+  coding is not `chunked`, even though such bodies are delimited by the
+  connection closing (RFC 9112 §6.3) and cannot be keep-alive reused.
+  `should_close` is now `True`, matching llhttp's
+  `llhttp_should_keep_alive` (`F_TRANSFER_ENCODING` without
+  `F_CHUNKED` ⇒ needs-EOF).
 
 These are all currently in place; this section assumes no regression.
 

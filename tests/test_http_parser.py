@@ -340,6 +340,90 @@ def test_partial_request_split_still_parses(parser: HttpRequestParser) -> None:
     assert messages[0][0].path == "/split"
 
 
+def test_max_field_size_fragmented_header_line_py(
+    event_loop: asyncio.AbstractEventLoop, server: Server[Request]
+) -> None:
+    """max_field_size applies to header lines completed in a later feed."""
+    protocol = RequestHandler(server, loop=event_loop)
+
+    parser = HttpRequestParserPy(
+        protocol,
+        event_loop,
+        2**16,
+        max_line_size=8190,
+        max_field_size=100,
+    )
+    protocol._parser = parser
+    parser.feed_data(b"GET / HTTP/1.1\r\n")
+    match = "400, message:\n  Got more than 100 bytes when reading"
+    with pytest.raises(http_exceptions.LineTooLong, match=match):
+        parser.feed_data(b"X-Big: " + b"a" * 500 + b"\r\n")
+
+
+def test_max_field_size_fragmented_header_tail_py(
+    event_loop: asyncio.AbstractEventLoop, server: Server[Request]
+) -> None:
+    """A header fragment buffered in the tail is measured with max_field_size."""
+    protocol = RequestHandler(server, loop=event_loop)
+
+    parser = HttpRequestParserPy(
+        protocol,
+        event_loop,
+        2**16,
+        max_line_size=8190,
+        max_field_size=100,
+    )
+    protocol._parser = parser
+    parser.feed_data(b"GET / HTTP/1.1\r\n")
+    match = "400, message:\n  Got more than 100 bytes when reading"
+    with pytest.raises(http_exceptions.LineTooLong, match=match):
+        parser.feed_data(b"X-Big: " + b"a" * 500)
+
+
+def test_response_max_field_size_fragmented_header_line_py(
+    event_loop: asyncio.AbstractEventLoop,
+) -> None:
+    """max_field_size applies to response header lines split across feeds."""
+    protocol = ResponseHandler(event_loop)
+
+    parser = HttpResponseParserPy(
+        protocol,
+        event_loop,
+        2**16,
+        max_line_size=8190,
+        max_field_size=100,
+        read_until_eof=True,
+    )
+    protocol._parser = parser
+    parser.feed_data(b"HTTP/1.1 200 OK\r\n")
+    match = "400, message:\n  Got more than 100 bytes when reading"
+    with pytest.raises(http_exceptions.LineTooLong, match=match):
+        parser.feed_data(b"X-Big: " + b"a" * 500 + b"\r\n")
+
+
+def test_max_line_size_pipelined_request_line_py(
+    event_loop: asyncio.AbstractEventLoop, server: Server[Request]
+) -> None:
+    """A pipelined request line is measured with max_line_size, not max_field_size."""
+    protocol = RequestHandler(server, loop=event_loop)
+
+    parser = HttpRequestParserPy(
+        protocol,
+        event_loop,
+        2**16,
+        max_line_size=8190,
+        max_field_size=100,
+    )
+    protocol._parser = parser
+    path = b"/" + b"a" * 200  # over max_field_size, under max_line_size
+    messages, _, _ = parser.feed_data(
+        b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"
+        b"GET " + path + b" HTTP/1.1\r\nHost: a\r\n\r\n"
+    )
+    assert len(messages) == 2
+    assert messages[1][0].path == path.decode()
+
+
 @pytest.mark.parametrize(
     "attacker",
     (
@@ -2125,6 +2209,44 @@ def test_http_response_parser_utf8_without_reason(response: HttpResponseParser) 
     assert msg.raw_headers == ((b"x-test", "тест".encode()),)
     assert not upgraded
     assert not tail
+
+
+def test_http_response_parser_te_chunked_keep_alive(
+    response: HttpResponseParser,
+) -> None:
+    messages, _, _ = response.feed_data(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+    )
+    msg = messages[0][0]
+    assert msg.chunked
+    assert not msg.should_close
+
+
+def test_http_response_parser_te_not_chunked_close(
+    response: HttpResponseParser,
+) -> None:
+    """A response whose final transfer coding is not chunked is EOF-delimited.
+
+    https://www.rfc-editor.org/rfc/rfc9112.html#section-6.3-2.8
+    """
+    messages, _, _ = response.feed_data(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n"
+    )
+    msg = messages[0][0]
+    assert not msg.chunked
+    assert msg.should_close
+
+
+def test_http_response_parser_te_chunked_not_final_close(
+    response: HttpResponseParser,
+) -> None:
+    """A chunked coding that is not final does not delimit the body."""
+    messages, _, _ = response.feed_data(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\n"
+    )
+    msg = messages[0][0]
+    assert not msg.chunked
+    assert msg.should_close
 
 
 def test_http_response_parser_obs_line_folding(response: HttpResponseParser) -> None:
