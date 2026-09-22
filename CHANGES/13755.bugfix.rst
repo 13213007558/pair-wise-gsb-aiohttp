@@ -1,0 +1,6 @@
+Fixed ``CookieJar.filter_cookies()`` returning cookies in
+shortest-path-first order -- the filtered cookies are now listed with
+longer paths first, as required by :rfc:`6265#section-5.4`, so the
+``Cookie`` header generated from them orders more specific cookies
+(e.g. ``Path=/foo/bar``) before less specific ones (e.g. ``Path=/``)
+-- by :user:`aio-libs`

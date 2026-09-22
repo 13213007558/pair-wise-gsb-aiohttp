@@ -2512,6 +2512,11 @@ Utilities
       Return jar's cookies acceptable for URL and available in
       ``Cookie`` header for sending client requests for given URL.
 
+      The returned cookies are ordered as required by
+      :rfc:`6265#section-5.4`: cookies with longer ``Path`` values are
+      listed before cookies with shorter ones, so more specific cookies
+      appear first in the ``Cookie`` header.
+
       :param ~yarl.URL response_url: request's URL for which cookies are asked.
 
       :return: :class:`http.cookies.SimpleCookie` with filtered

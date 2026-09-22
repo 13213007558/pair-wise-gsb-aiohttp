@@ -1980,3 +1980,90 @@ def test_update_cookies_negative_max_age_beyond_float_range_expires() -> None:
 
     assert "sid" not in jar.filter_cookies(url)
     assert len(jar) == 0
+
+
+def test_filter_cookies_orders_longest_path_first() -> None:
+    """RFC 6265 §5.4: longer paths are listed before shorter paths."""
+    jar = CookieJar()
+    jar.update_cookies_from_headers(["rootc=1; Path=/"], URL("http://example.com/"))
+    jar.update_cookies_from_headers(
+        ["deepc=2; Path=/foo/bar"], URL("http://example.com/foo/bar")
+    )
+    jar.update_cookies_from_headers(
+        ["midc=3; Path=/foo"], URL("http://example.com/foo")
+    )
+
+    filtered = jar.filter_cookies(URL("http://example.com/foo/bar/x"))
+
+    assert list(filtered.keys()) == ["deepc", "midc", "rootc"]
+    assert filtered.output(header="", sep=";").strip() == ("deepc=2; midc=3; rootc=1")
+
+
+def test_filter_cookies_equal_path_length_keeps_creation_order() -> None:
+    """Cookies with equal path lengths keep their insertion order."""
+    jar = CookieJar()
+    jar.update_cookies_from_headers(
+        ["first=1; Path=/foo"], URL("http://example.com/foo")
+    )
+    jar.update_cookies_from_headers(
+        ["second=2; Path=/foo"], URL("http://example.com/foo")
+    )
+    jar.update_cookies_from_headers(
+        ["third=3; Path=/foo"], URL("http://example.com/foo")
+    )
+
+    filtered = jar.filter_cookies(URL("http://example.com/foo"))
+
+    assert list(filtered.keys()) == ["first", "second", "third"]
+
+
+def test_filter_cookies_same_name_narrowest_path_wins_and_sorts_first() -> None:
+    """A same-name cookie on a narrower path wins and is listed first."""
+    jar = CookieJar()
+    jar.update_cookies_from_headers(["n=root; Path=/"], URL("http://example.com/"))
+    jar.update_cookies_from_headers(
+        ["n=narrow; Path=/foo"], URL("http://example.com/foo")
+    )
+    jar.update_cookies_from_headers(["other=x; Path=/"], URL("http://example.com/"))
+
+    filtered = jar.filter_cookies(URL("http://example.com/foo/x"))
+
+    # The narrower /foo value wins for the duplicate name, and its greater
+    # path depth sorts it ahead of the root-path cookie.
+    assert [(name, m.value) for name, m in filtered.items()] == [
+        ("n", "narrow"),
+        ("other", "x"),
+    ]
+
+
+def test_filter_cookies_path_boundary_foo_does_not_match_foobar() -> None:
+    """Path=/foo must not match /foobar, but matches /foo and /foo/bar."""
+    jar = CookieJar()
+    jar.update_cookies_from_headers(["p=1; Path=/foo"], URL("http://example.com/foo"))
+
+    assert "p" not in jar.filter_cookies(URL("http://example.com/foobar"))
+    assert "p" not in jar.filter_cookies(URL("http://example.com/fo"))
+    assert jar.filter_cookies(URL("http://example.com/foo"))["p"].value == "1"
+    assert jar.filter_cookies(URL("http://example.com/foo/"))["p"].value == "1"
+    assert jar.filter_cookies(URL("http://example.com/foo/bar"))["p"].value == "1"
+
+
+def test_expire_cookie_on_narrow_path_keeps_root_path_value() -> None:
+    """A server deleting name on /foo must not delete the same name on /."""
+    jar = CookieJar()
+    jar.update_cookies_from_headers(["n=root; Path=/"], URL("http://example.com/"))
+    jar.update_cookies_from_headers(
+        ["n=narrow; Path=/foo"], URL("http://example.com/foo")
+    )
+
+    jar.update_cookies_from_headers(
+        ['n=""; Path=/foo; Max-Age=0'], URL("http://example.com/foo")
+    )
+
+    assert jar.filter_cookies(URL("http://example.com/"))["n"].value == "root"
+    filtered = jar.filter_cookies(URL("http://example.com/foo/x"))
+    assert filtered["n"].value == "root"
+    # The expired /foo entry is gone from the jar entirely.
+    assert ("example.com", "/foo") not in jar.cookies or (
+        "n" not in jar.cookies[("example.com", "/foo")]
+    )

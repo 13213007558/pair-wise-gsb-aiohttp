@@ -454,16 +454,21 @@ class CookieJar(AbstractCookieJar):
 
         # Send shared cookie
         key = ("", "")
+        # Track the path depth of the winning morsel for each cookie name so
+        # the result can be ordered longest-path-first per RFC 6265 §5.4.
+        path_depths: dict[str, int] = {}
         for c in self._cookies[key].values():
             # Check cache first
             if c.key in self._morsel_cache[key]:
                 filtered[c.key] = self._morsel_cache[key][c.key]
+                path_depths[c.key] = 0
                 continue
 
             # Build and cache the morsel
             mrsl_val = self._build_morsel(c)
             self._morsel_cache[key][c.key] = mrsl_val
             filtered[c.key] = mrsl_val
+            path_depths[c.key] = 0
 
         if is_ip_address(hostname):
             if not self._unsafe:
@@ -501,12 +506,29 @@ class CookieJar(AbstractCookieJar):
                 # We already built the Morsel so reuse it here
                 if name in self._morsel_cache[p]:
                     filtered[name] = self._morsel_cache[p][name]
+                    path_depths[name] = len(p[1])
                     continue
 
                 # Build and cache the morsel
                 mrsl_val = self._build_morsel(cookie)
                 self._morsel_cache[p][name] = mrsl_val
                 filtered[name] = mrsl_val
+                path_depths[name] = len(p[1])
+
+        if len(filtered) > 1:
+            # Point 2: https://www.rfc-editor.org/rfc/rfc6265.html#section-5.4
+            # Cookies with longer paths are listed before cookies with
+            # shorter paths. The sort is stable, so cookies with equal path
+            # lengths keep their insertion (creation) order. Iterating the
+            # (domain, path) pairs from the shortest path upwards already
+            # made the most specific morsel win for duplicate names; this
+            # only reorders the surviving morsels for the Cookie header.
+            ordered: BaseCookie[str] = BaseCookie()
+            for name, morsel in sorted(
+                filtered.items(), key=lambda item: -path_depths[item[0]]
+            ):
+                ordered[name] = morsel
+            filtered = ordered
 
         return filtered
 

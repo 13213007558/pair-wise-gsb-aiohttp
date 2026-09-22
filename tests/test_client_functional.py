@@ -2834,6 +2834,106 @@ async def test_cookies_redirect(aiohttp_client: AiohttpClient) -> None:
         assert 200 == resp.status
 
 
+async def test_cookies_multihop_redirect_chain_updates_jar(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    """Each redirect hop updates the shared jar; later hops see earlier cookies."""
+
+    async def redirect1(request: web.Request) -> web.Response:
+        ret = web.Response(status=302, headers={"Location": "/redirect2"})
+        ret.set_cookie("hop1", "1")
+        return ret
+
+    async def redirect2(request: web.Request) -> web.Response:
+        # The cookie set by the previous hop is already in the jar.
+        assert request.cookies["hop1"] == "1"
+        ret = web.Response(status=302, headers={"Location": "/final"})
+        ret.set_cookie("hop2", "2", path="/")
+        return ret
+
+    async def final(request: web.Request) -> web.Response:
+        assert request.cookies["hop1"] == "1"
+        assert request.cookies["hop2"] == "2"
+        return web.Response()
+
+    app = web.Application()
+    app.router.add_get("/redirect1", redirect1)
+    app.router.add_get("/redirect2", redirect2)
+    app.router.add_get("/final", final)
+
+    client = await aiohttp_client(app)
+    async with client.get("/redirect1") as resp:
+        assert 200 == resp.status
+
+    # Every cookie the session sent is traceable to a jar entry keyed by
+    # (response host, path); the chain left exactly these two entries.
+    jar = client.session.cookie_jar
+    jar_names = {morsel.key for morsel in jar}
+    assert jar_names == {"hop1", "hop2"}
+
+
+async def test_host_only_cookie_not_leaked_on_cross_subdomain_redirect(
+    create_server_for_url_and_handler: Callable[[URL, Handler], Awaitable[TestServer]],
+) -> None:
+    """A host-only cookie must not follow a redirect to a descendant host."""
+    url_from = URL("http://auth.example.com/start")
+    url_to = URL("http://evil.auth.example.com/final")
+
+    async def srv_from(request: web.Request) -> web.Response:
+        assert request.host.split(":")[0] == url_from.host
+        ret = web.Response(status=302, headers={"Location": str(url_to)})
+        # Host-only cookie: no Domain attribute, scoped to auth.example.com.
+        ret.set_cookie("sid", "secret")
+        return ret
+
+    async def srv_to(request: web.Request) -> web.Response:
+        assert request.host.split(":")[0] == url_to.host
+        assert "sid" not in request.cookies, "Host-only cookie leaked to subdomain"
+        assert "Cookie" not in request.headers
+        return web.Response()
+
+    server_from = await create_server_for_url_and_handler(url_from, srv_from)
+    server_to = await create_server_for_url_and_handler(url_to, srv_to)
+
+    etc_hosts = {
+        (url_from.host, 80): server_from,
+        (url_to.host, 80): server_to,
+    }
+
+    class FakeResolver(AbstractResolver):
+        async def resolve(
+            self,
+            host: str,
+            port: int = 0,
+            family: socket.AddressFamily = socket.AF_INET,
+        ) -> list[ResolveResult]:
+            server = etc_hosts[(host, port)]
+            assert server.port is not None
+
+            return [
+                {
+                    "hostname": host,
+                    "host": server.host,
+                    "port": server.port,
+                    "family": socket.AF_INET,
+                    "proto": 0,
+                    "flags": socket.AI_NUMERICHOST,
+                }
+            ]
+
+        async def close(self) -> None:
+            """Dummy"""
+
+    connector = aiohttp.TCPConnector(resolver=FakeResolver(), ssl=False)
+
+    async with aiohttp.ClientSession(connector=connector) as client:
+        async with client.get(url_from) as resp:
+            assert resp.status == 200
+        # The cookie is still scoped to the origin host only.
+        assert "sid" in client.cookie_jar.filter_cookies(url_from)
+        assert "sid" not in client.cookie_jar.filter_cookies(url_to)
+
+
 async def test_cookies_on_empty_session_jar(aiohttp_client: AiohttpClient) -> None:
     async def handler(request: web.Request) -> web.Response:
         assert "custom-cookie" in request.cookies
