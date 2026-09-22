@@ -428,6 +428,7 @@ on the wire. The wire-side consumer is the **untrusted** counterparty
 | 2.6 | Body-suppression edge cases | `web_response.py:StreamResponse._prepare_headers` strips `Content-Length` and `Transfer-Encoding` for HEAD / 1xx / 204 / 304 (`EMPTY_BODY_STATUS_CODES`, `helpers.py:EMPTY_BODY_METHODS`). The framework's own machinery doesn't write a body for these. | **User**: Do not call `resp.write(...)` in a handler responding HEAD / 1xx / 204 / 304 — framing strips CL / TE but does not block the byte write. **Optional aiohttp change: have `StreamWriter` short-circuit body writes when `length == 0` and the response was framed as empty-body.** |
 | 2.7 | Cookie injection | `populate_with_cookies` (`helpers.py:populate_with_cookies`) routes the cookie through `SimpleCookie.output()` and then into a regular header, where the forbidden-CTL check at write-time catches anything `SimpleCookie` happened to pass through. | Documented design decision: rely on writer-level validation rather than tightening `set_cookie` / `populate_with_cookies` further. Keep regression tests covering cookie name/value with forbidden CTLs across both backends. |
 | 2.8 | Manual `Content-Encoding` | Server side: `enable_compression()` (`web_response.py:StreamResponse.enable_compression`) returns early if `Content-Encoding` already present, so the body is not double-compressed. Client side: `ClientRequest._update_content_encoding` raises `ValueError("compress can not be set if Content-Encoding header is set")` — symmetric guard. | None. |
+| 2.8a | `Accept-Encoding` negotiation | `web_response.py:_parse_accept_encoding` parses the untrusted request header token-wise (no substring matching); q-values are clamped to `[0, 1]`, malformed q-values and unsupported codings resolve to "not acceptable", so a hostile header can only ever *prevent* compression, never trigger unexpected codings or framing. Compression is skipped for 1xx/204/304, `Range` and already-encoded responses, and a strong `ETag` is downgraded to weak when the representation is compressed, so framing/validator headers always describe the bytes actually sent. | None. |
 | 2.9 | Drain / backpressure | `StreamWriter.write` drains at `LIMIT = 0x10000` bytes (`http_writer.py:StreamWriter.write`) when `drain=True` is set by the caller. Application code is expected to `await write(...)` to honour backpressure. | **User**: `await write(...)` in handlers; tight `for` loops without `await` can starve the event loop. Cross-reference [§5.7](#57-server-connection-lifecycle) for connection-level read/write timeouts that mitigate slow consumers. |
 | 2.10 | Oversized single chunk | None at the writer layer — bytes go straight to `transport.write`. asyncio applies its own high-water marks via the transport. | **User**: Relies on application-level bounds (use streaming, generators, `FileResponse`, etc., for large bodies). |
 | 2.11 | Chunked hex framing | The writer always uses `f"{len(chunk):x}\r\n"` followed by the chunk and `\r\n` (`http_writer.py:StreamWriter._write_chunked_payload`). | None. |
@@ -449,8 +450,16 @@ on the wire. The wire-side consumer is the **untrusted** counterparty
   CVE) — outbound header serialization only rejected CR/LF/NUL; other
   RFC 9110 §5.5 / RFC 9112 §4 forbidden CTLs (`0x01-0x08`, `0x0B-0x1F`,
   `0x7F`) could be emitted on the wire if a handler placed them into a
-  header. Tightened `_safe_header` and `_write_str_raise_on_nlcr` to
-  reject the full forbidden set (threat 2.1).
+   header. Tightened `_safe_header` and `_write_str_raise_on_nlcr` to
+   reject the full forbidden set (threat 2.1).
+- **Compression header semantics** (hardening, no CVE) — `Accept-Encoding`
+  was matched by substring, so `q=0` ("not acceptable"), wildcards and
+  look-alike coding names (e.g. `xgzip`) were mishandled, and framing /
+  validator headers (`Content-Length`, strong `ETag`) could describe the
+  pre-compression entity. Negotiation is now token-based with q-value
+  support, `Vary: Accept-Encoding` is emitted once, strong ETags are
+  downgraded to weak on compression, and 1xx/204/304, `Range` and
+  already-encoded responses are never (re-)compressed (threats 2.4, 2.8a).
 
 Writer-level forbidden-CTL rejection via `_safe_header` and
 `_write_str_raise_on_nlcr` has been in place since the header-injection

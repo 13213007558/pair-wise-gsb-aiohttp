@@ -751,6 +751,330 @@ async def test_rm_content_length_if_compression_http10() -> None:
     assert resp.content_length is None
 
 
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_selects_highest_qvalue() -> None:
+    req = make_request(
+        "GET",
+        "/",
+        headers=CIMultiDict({hdrs.ACCEPT_ENCODING: "gzip;q=1.0, deflate;q=0.5"}),
+    )
+    resp = web.StreamResponse()
+    resp.enable_compression()
+
+    await resp.prepare(req)
+    assert resp.headers[hdrs.CONTENT_ENCODING] == "gzip"
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_server_preference_on_qvalue_tie() -> None:
+    req = make_request(
+        "GET",
+        "/",
+        headers=CIMultiDict({hdrs.ACCEPT_ENCODING: "gzip;q=1, deflate;q=1"}),
+    )
+    resp = web.StreamResponse()
+    resp.enable_compression()
+
+    await resp.prepare(req)
+    assert resp.headers[hdrs.CONTENT_ENCODING] == "deflate"
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_qvalue_zero_means_unacceptable() -> None:
+    req = make_request(
+        "GET",
+        "/",
+        headers=CIMultiDict({hdrs.ACCEPT_ENCODING: "gzip;q=0, deflate;q=0"}),
+    )
+    resp = web.StreamResponse()
+    resp.enable_compression()
+
+    await resp.prepare(req)
+    assert hdrs.CONTENT_ENCODING not in resp.headers
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_wildcard() -> None:
+    req = make_request("GET", "/", headers=CIMultiDict({hdrs.ACCEPT_ENCODING: "*"}))
+    resp = web.StreamResponse()
+    resp.enable_compression()
+
+    await resp.prepare(req)
+    assert resp.headers[hdrs.CONTENT_ENCODING] == "deflate"
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_wildcard_does_not_override_explicit_qvalue() -> None:
+    req = make_request(
+        "GET",
+        "/",
+        headers=CIMultiDict({hdrs.ACCEPT_ENCODING: "deflate;q=0, *;q=0.5"}),
+    )
+    resp = web.StreamResponse()
+    resp.enable_compression()
+
+    await resp.prepare(req)
+    assert resp.headers[hdrs.CONTENT_ENCODING] == "gzip"
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_identity_only_means_no_compression() -> None:
+    req = make_request(
+        "GET", "/", headers=CIMultiDict({hdrs.ACCEPT_ENCODING: "identity"})
+    )
+    resp = web.StreamResponse()
+    resp.enable_compression()
+
+    await resp.prepare(req)
+    assert hdrs.CONTENT_ENCODING not in resp.headers
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_identity_qvalue_zero_does_not_block_others() -> None:
+    req = make_request(
+        "GET",
+        "/",
+        headers=CIMultiDict({hdrs.ACCEPT_ENCODING: "identity;q=0, gzip"}),
+    )
+    resp = web.StreamResponse()
+    resp.enable_compression()
+
+    await resp.prepare(req)
+    assert resp.headers[hdrs.CONTENT_ENCODING] == "gzip"
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_duplicate_coding_uses_highest_qvalue() -> None:
+    req = make_request(
+        "GET",
+        "/",
+        headers=CIMultiDict({hdrs.ACCEPT_ENCODING: "gzip;q=0.1, gzip;q=0.9"}),
+    )
+    resp = web.StreamResponse()
+    resp.enable_compression()
+
+    await resp.prepare(req)
+    assert resp.headers[hdrs.CONTENT_ENCODING] == "gzip"
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_unsupported_codings_ignored() -> None:
+    req = make_request(
+        "GET", "/", headers=CIMultiDict({hdrs.ACCEPT_ENCODING: "br, zstd"})
+    )
+    resp = web.StreamResponse()
+    resp.enable_compression()
+
+    await resp.prepare(req)
+    assert hdrs.CONTENT_ENCODING not in resp.headers
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_unsupported_and_supported_codings() -> None:
+    req = make_request(
+        "GET",
+        "/",
+        headers=CIMultiDict({hdrs.ACCEPT_ENCODING: "br;q=1, gzip;q=0.5"}),
+    )
+    resp = web.StreamResponse()
+    resp.enable_compression()
+
+    await resp.prepare(req)
+    assert resp.headers[hdrs.CONTENT_ENCODING] == "gzip"
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_coding_case_insensitive() -> None:
+    req = make_request("GET", "/", headers=CIMultiDict({hdrs.ACCEPT_ENCODING: "GZip"}))
+    resp = web.StreamResponse()
+    resp.enable_compression()
+
+    await resp.prepare(req)
+    assert resp.headers[hdrs.CONTENT_ENCODING] == "gzip"
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_no_substring_match() -> None:
+    req = make_request("GET", "/", headers=CIMultiDict({hdrs.ACCEPT_ENCODING: "xgzip"}))
+    resp = web.StreamResponse()
+    resp.enable_compression()
+
+    await resp.prepare(req)
+    assert hdrs.CONTENT_ENCODING not in resp.headers
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_malformed_qvalue_means_unacceptable() -> None:
+    req = make_request(
+        "GET", "/", headers=CIMultiDict({hdrs.ACCEPT_ENCODING: "gzip;q=abc"})
+    )
+    resp = web.StreamResponse()
+    resp.enable_compression()
+
+    await resp.prepare(req)
+    assert hdrs.CONTENT_ENCODING not in resp.headers
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_empty_accept_encoding() -> None:
+    req = make_request("GET", "/", headers=CIMultiDict({hdrs.ACCEPT_ENCODING: ""}))
+    resp = web.StreamResponse()
+    resp.enable_compression()
+
+    await resp.prepare(req)
+    assert hdrs.CONTENT_ENCODING not in resp.headers
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_adds_vary_accept_encoding() -> None:
+    req = make_request("GET", "/")
+    resp = web.StreamResponse()
+    resp.enable_compression()
+
+    await resp.prepare(req)
+    assert resp.headers.getall(hdrs.VARY) == [hdrs.ACCEPT_ENCODING]
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_vary_not_duplicated() -> None:
+    req = make_request("GET", "/", headers=CIMultiDict({hdrs.ACCEPT_ENCODING: "gzip"}))
+    resp = web.StreamResponse(
+        headers={hdrs.VARY: "Accept-Encoding"},
+    )
+    resp.enable_compression()
+
+    await resp.prepare(req)
+    assert resp.headers.getall(hdrs.VARY) == ["Accept-Encoding"]
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_vary_merged_with_existing_value() -> None:
+    req = make_request("GET", "/", headers=CIMultiDict({hdrs.ACCEPT_ENCODING: "gzip"}))
+    resp = web.StreamResponse(headers={hdrs.VARY: "Cookie"})
+    resp.enable_compression()
+
+    await resp.prepare(req)
+    vary = resp.headers.getall(hdrs.VARY)
+    assert vary.count(hdrs.ACCEPT_ENCODING) == 1
+    assert "Cookie" in vary
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_downgrades_strong_etag() -> None:
+    req = make_request("GET", "/", headers=CIMultiDict({hdrs.ACCEPT_ENCODING: "gzip"}))
+    resp = web.Response(body=b"answer")
+    resp.etag = "some-tag"
+    resp.enable_compression()
+
+    await resp.prepare(req)
+    assert resp.headers[hdrs.ETAG] == 'W/"some-tag"'
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_keeps_weak_etag() -> None:
+    req = make_request("GET", "/", headers=CIMultiDict({hdrs.ACCEPT_ENCODING: "gzip"}))
+    resp = web.Response(body=b"answer")
+    resp.etag = ETag(value="some-tag", is_weak=True)
+    resp.enable_compression()
+
+    await resp.prepare(req)
+    assert resp.headers[hdrs.ETAG] == 'W/"some-tag"'
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_stream_response_downgrades_strong_etag() -> None:
+    req = make_request("GET", "/", headers=CIMultiDict({hdrs.ACCEPT_ENCODING: "gzip"}))
+    resp = web.StreamResponse()
+    resp.etag = "some-tag"
+    resp.enable_compression()
+
+    await resp.prepare(req)
+    assert resp.headers[hdrs.ETAG] == 'W/"some-tag"'
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_identity_keeps_strong_etag() -> None:
+    req = make_request("GET", "/")
+    resp = web.Response(body=b"answer")
+    resp.etag = "some-tag"
+    resp.enable_compression(web.ContentCoding.identity)
+
+    await resp.prepare(req)
+    assert resp.headers[hdrs.ETAG] == '"some-tag"'
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_no_compression_for_204() -> None:
+    req = make_request("GET", "/", headers=CIMultiDict({hdrs.ACCEPT_ENCODING: "gzip"}))
+    resp = web.Response(body=b"answer", status=204)
+    resp.enable_compression()
+
+    await resp.prepare(req)
+    assert hdrs.CONTENT_ENCODING not in resp.headers
+    assert hdrs.CONTENT_LENGTH not in resp.headers
+    assert resp._compressed_body is None
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_no_compression_for_304() -> None:
+    req = make_request("GET", "/", headers=CIMultiDict({hdrs.ACCEPT_ENCODING: "gzip"}))
+    resp = web.Response(status=304)
+    resp.etag = "some-tag"
+    resp.enable_compression()
+
+    await resp.prepare(req)
+    assert hdrs.CONTENT_ENCODING not in resp.headers
+    assert hdrs.CONTENT_LENGTH not in resp.headers
+    # The 304 validator still describes the stored representation.
+    assert resp.headers[hdrs.ETAG] == '"some-tag"'
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_head_describes_compressed_representation() -> None:
+    req = make_request("HEAD", "/", headers=CIMultiDict({hdrs.ACCEPT_ENCODING: "gzip"}))
+    resp = web.Response(body=b"answer")
+    resp.enable_compression()
+
+    await resp.prepare(req)
+    assert resp.headers[hdrs.CONTENT_ENCODING] == "gzip"
+    # Content-Length describes the compressed GET representation.
+    assert resp.content_length == 26
+    assert resp.headers[hdrs.CONTENT_LENGTH] == "26"
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_no_compression_for_range_response() -> None:
+    req = make_request(
+        "GET",
+        "/",
+        headers=CIMultiDict({hdrs.ACCEPT_ENCODING: "gzip", hdrs.RANGE: "bytes=0-3"}),
+    )
+    resp = web.StreamResponse(status=206)
+    resp.content_length = 4
+    resp.headers[hdrs.CONTENT_RANGE] = "bytes 0-3/10"
+    resp.enable_compression()
+
+    msg = await resp.prepare(req)
+    assert hdrs.CONTENT_ENCODING not in resp.headers
+    assert resp.headers[hdrs.CONTENT_LENGTH] == "4"
+    assert not msg.enable_compression.called  # type: ignore[attr-defined]
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_no_compression_when_content_encoding_set_later() -> None:
+    req = make_request("GET", "/", headers=CIMultiDict({hdrs.ACCEPT_ENCODING: "gzip"}))
+    resp = web.Response(body=b"answer")
+    resp.enable_compression()
+    # The application marks the body as already encoded after enabling
+    # compression; the body must not be compressed again.
+    resp.headers[hdrs.CONTENT_ENCODING] = "br"
+
+    await resp.prepare(req)
+    assert resp.headers[hdrs.CONTENT_ENCODING] == "br"
+    assert resp._compressed_body is None
+    assert resp.content_length == 6
+
+
 async def test_rm_content_length_if_204() -> None:
     """Ensure content-length is removed for 204 responses."""
     writer = mock.create_autospec(StreamWriter, spec_set=True, instance=True)

@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import gzip
 import io
 import json
 import os
@@ -33,7 +34,15 @@ from aiohttp._websocket.writer import WebSocketWriter
 from aiohttp.abc import AbstractResolver, ResolveResult
 from aiohttp.base_protocol import BaseProtocol
 from aiohttp.compression_utils import ZLibBackend, ZLibCompressObjProtocol
-from aiohttp.hdrs import CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING
+from aiohttp.hdrs import (
+    ACCEPT_ENCODING,
+    CONTENT_ENCODING,
+    CONTENT_LENGTH,
+    CONTENT_TYPE,
+    ETAG,
+    TRANSFER_ENCODING,
+    VARY,
+)
 from aiohttp.helpers import DEFAULT_CHUNK_SIZE, HeadersDictProxy
 from aiohttp.http import WSMsgType
 from aiohttp.streams import StreamReader
@@ -3290,3 +3299,179 @@ async def test_keepalive_expires_on_time(aiohttp_client: AiohttpClient) -> None:
 
         # Ensure the keep alive handle expires
         assert request_handler._keepalive_handle is None
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_small_body_headers_describe_entity(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    """Content-Length and Content-Encoding describe the compressed entity."""
+    body = b"small response body" * 10
+
+    async def handler(request: web.Request) -> web.Response:
+        resp = web.Response(body=body)
+        resp.enable_compression()
+        return resp
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    client = await aiohttp_client(app, auto_decompress=False)
+
+    async with client.get("/", headers={ACCEPT_ENCODING: "gzip, deflate"}) as resp:
+        assert resp.status == 200
+        assert resp.headers[CONTENT_ENCODING] == "deflate"
+        raw = await resp.read()
+        assert int(resp.headers[CONTENT_LENGTH]) == len(raw)
+        assert zlib.decompress(raw) == body
+        assert resp.headers.getall(VARY) == ["Accept-Encoding"]
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_large_body_headers_describe_entity(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    """Large bodies take the executor path but headers still match the entity."""
+    body = b"0123456789abcdef" * 65536  # 1 MiB, past the sync compression threshold
+
+    async def handler(request: web.Request) -> web.Response:
+        resp = web.Response(body=body)
+        resp.enable_compression()
+        return resp
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    client = await aiohttp_client(app, auto_decompress=False)
+
+    async with client.get("/", headers={ACCEPT_ENCODING: "gzip, deflate"}) as resp:
+        assert resp.status == 200
+        assert resp.headers[CONTENT_ENCODING] == "deflate"
+        raw = await resp.read()
+        assert int(resp.headers[CONTENT_LENGTH]) == len(raw)
+        assert zlib.decompress(raw) == body
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_stream_response_chunked_and_connection_reused(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    """Streamed compressed responses are chunked and keep the connection alive."""
+    chunks = [b"chunk1", b"chunk2", b"chunk3"]
+
+    async def handler(request: web.Request) -> web.StreamResponse:
+        resp = web.StreamResponse()
+        resp.enable_compression()
+        await resp.prepare(request)
+        for chunk in chunks:
+            await resp.write(chunk)
+        await resp.write_eof()
+        return resp
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    client = await aiohttp_client(app, auto_decompress=False)
+
+    for _ in range(2):  # the second request reuses the keep-alive connection
+        async with client.get("/", headers={ACCEPT_ENCODING: "gzip"}) as resp:
+            assert resp.status == 200
+            assert resp.headers[CONTENT_ENCODING] == "gzip"
+            assert resp.headers[TRANSFER_ENCODING] == "chunked"
+            assert CONTENT_LENGTH not in resp.headers
+            raw = await resp.read()
+            assert gzip.decompress(raw) == b"".join(chunks)
+            assert "close" not in resp.headers.get("Connection", "")
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_head_matches_get_headers(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    """HEAD describes the same compressed representation as GET."""
+    body = b"answer" * 100
+
+    async def handler(request: web.Request) -> web.Response:
+        resp = web.Response(body=body)
+        resp.enable_compression()
+        return resp
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    client = await aiohttp_client(app, auto_decompress=False)
+
+    async with client.get("/", headers={ACCEPT_ENCODING: "gzip"}) as get_resp:
+        assert get_resp.headers[CONTENT_ENCODING] == "gzip"
+        get_length = get_resp.headers[CONTENT_LENGTH]
+        assert gzip.decompress(await get_resp.read()) == body
+
+    async with client.head("/", headers={ACCEPT_ENCODING: "gzip"}) as head_resp:
+        assert head_resp.status == 200
+        assert head_resp.headers[CONTENT_ENCODING] == "gzip"
+        assert head_resp.headers[CONTENT_LENGTH] == get_length
+        assert await head_resp.read() == b""
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_not_applied_to_304(aiohttp_client: AiohttpClient) -> None:
+    """304 responses carry no representation, so no Content-Encoding is sent."""
+
+    async def handler(request: web.Request) -> web.Response:
+        resp = web.Response(status=304)
+        resp.etag = "some-tag"
+        resp.enable_compression()
+        return resp
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    client = await aiohttp_client(app, auto_decompress=False)
+
+    async with client.get("/", headers={ACCEPT_ENCODING: "gzip"}) as resp:
+        assert resp.status == 304
+        assert CONTENT_ENCODING not in resp.headers
+        assert resp.headers[ETAG] == '"some-tag"'
+        assert await resp.read() == b""
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_weakens_strong_etag(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    """A strong ETag is downgraded to weak when the entity is compressed."""
+
+    async def handler(request: web.Request) -> web.Response:
+        resp = web.Response(body=b"answer" * 100)
+        resp.etag = "some-tag"
+        resp.enable_compression()
+        return resp
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    client = await aiohttp_client(app, auto_decompress=False)
+
+    async with client.get("/", headers={ACCEPT_ENCODING: "gzip"}) as resp:
+        assert resp.headers[ETAG] == 'W/"some-tag"'
+        assert resp.headers.getall(VARY) == ["Accept-Encoding"]
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_compression_negotiation_respects_qvalues(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    body = b"answer" * 100
+
+    async def handler(request: web.Request) -> web.Response:
+        resp = web.Response(body=body)
+        resp.enable_compression()
+        return resp
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    client = await aiohttp_client(app, auto_decompress=False)
+
+    async with client.get(
+        "/", headers={ACCEPT_ENCODING: "deflate;q=0.5, gzip"}
+    ) as resp:
+        assert resp.headers[CONTENT_ENCODING] == "gzip"
+        assert gzip.decompress(await resp.read()) == body
+
+    async with client.get("/", headers={ACCEPT_ENCODING: "gzip;q=0"}) as resp:
+        assert CONTENT_ENCODING not in resp.headers
+        assert await resp.read() == body

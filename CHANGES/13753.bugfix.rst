@@ -1,0 +1,8 @@
+Fixed ``StreamResponse``/``Response`` compression header semantics: the
+``Accept-Encoding`` negotiation now honours q-values, wildcards, ``identity``
+and duplicate or unsupported codings instead of substring matching;
+``Vary: Accept-Encoding`` is emitted exactly once; a strong ``ETag`` is
+downgraded to a weak validator when the representation is compressed;
+and compression is no longer applied to 1xx/204/304 responses, ``Range``
+responses, or bodies that already carry a ``Content-Encoding`` -- by
+:user:`aio-libs`.

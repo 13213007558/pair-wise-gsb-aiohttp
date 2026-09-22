@@ -65,6 +65,35 @@ class ContentCoding(enum.Enum):
 
 CONTENT_CODINGS = {coding.value: coding for coding in ContentCoding}
 
+
+def _parse_accept_encoding(header: str) -> dict[str, float]:
+    """Parse an Accept-Encoding header into a mapping of coding to qvalue.
+
+    Coding names are matched case-insensitively. When the same coding is
+    listed more than once, the highest qvalue wins. Codings with a
+    malformed qvalue are treated as unacceptable (q=0).
+    """
+    codings: dict[str, float] = {}
+    for item in header.split(","):
+        coding, _, params = item.partition(";")
+        coding = coding.strip().lower()
+        if not coding:
+            continue
+        quality = 1.0
+        for param in params.split(";"):
+            name, _, value = param.partition("=")
+            if name.strip() == "q":
+                try:
+                    quality = float(value.strip())
+                except ValueError:
+                    quality = 0.0
+                else:
+                    quality = min(1.0, max(0.0, quality))
+        if coding not in codings or quality > codings[coding]:
+            codings[coding] = quality
+    return codings
+
+
 ############################################################
 # HTTP Response classes
 ############################################################
@@ -338,18 +367,66 @@ class StreamResponse(
         # Compressed payload may have different content length,
         # remove the header
         self._headers.popall(hdrs.CONTENT_LENGTH, None)
+        self._downgrade_strong_etag()
 
     async def _start_compression(self, request: "BaseRequest") -> None:
+        # The selected representation depends on the request's
+        # Accept-Encoding header, so caches must key on it. Add the
+        # Vary header even when negotiation below selects the identity
+        # coding, but never emit it twice.
+        vary = self._headers.getall(hdrs.VARY, ())
+        if not any(
+            "accept-encoding" in (part.strip() for part in value.lower().split(","))
+            for value in vary
+        ):
+            self._headers.add(hdrs.VARY, hdrs.ACCEPT_ENCODING)
+
+        # Never compress a representation that is already encoded,
+        # a partial (Range) representation, or a response that must not
+        # carry a body at all (1xx, 204, 304). HEAD responses are
+        # compressed so their headers describe the GET representation.
+        if (
+            hdrs.CONTENT_ENCODING in self._headers
+            or hdrs.CONTENT_RANGE in self._headers
+            or (self._must_be_empty_body and request.method != hdrs.METH_HEAD)
+        ):
+            return
+
         if self._compression_force:
             await self._do_start_compression(self._compression_force)
             return
+        accept_encoding = request.headers.get(hdrs.ACCEPT_ENCODING)
+        if accept_encoding is None:
+            return
         # Encoding comparisons should be case-insensitive
         # https://www.rfc-editor.org/rfc/rfc9110#section-8.4.1
-        accept_encoding = request.headers.get(hdrs.ACCEPT_ENCODING, "").lower()
+        codings = _parse_accept_encoding(accept_encoding)
+        wildcard = codings.get("*", 0.0)
+        best_coding: ContentCoding | None = None
+        best_quality = 0.0
         for value, coding in CONTENT_CODINGS.items():
-            if value in accept_encoding:
-                await self._do_start_compression(coding)
-                return
+            if coding is ContentCoding.identity:
+                # Identity means no compression; there is nothing to start.
+                continue
+            quality = codings.get(value, wildcard)
+            if quality > best_quality:
+                best_coding = coding
+                best_quality = quality
+        if best_coding is not None:
+            await self._do_start_compression(best_coding)
+
+    def _downgrade_strong_etag(self) -> None:
+        """Downgrade a strong ETag to a weak one.
+
+        Compression changes the representation data, so a strong
+        validator computed over the uncompressed representation must not
+        be sent alongside the compressed one (RFC 9110, section 8.8.3).
+        Weak validators are left untouched since the representations
+        remain semantically equivalent.
+        """
+        etag = self.etag
+        if etag is not None and not etag.is_weak and etag.value != ETAG_ANY:
+            self.etag = ETag(value=etag.value, is_weak=True)
 
     async def prepare(self, request: "BaseRequest") -> AbstractStreamWriter | None:
         if self._eof_sent:
@@ -735,6 +812,7 @@ class Response(StreamResponse):
         )
         self._headers[hdrs.CONTENT_ENCODING] = coding.value
         self._headers[hdrs.CONTENT_LENGTH] = str(len(self._compressed_body))
+        self._downgrade_strong_etag()
 
 
 def json_response(

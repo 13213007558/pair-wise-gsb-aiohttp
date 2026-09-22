@@ -715,6 +715,19 @@ and :ref:`aiohttp-web-signals` handlers::
       *Accept-Encoding* is not checked if *force* is set to a
       :class:`ContentCoding`.
 
+      The negotiation honours q-values, the ``*`` wildcard and
+      ``identity``; codings aiohttp cannot produce are ignored. When
+      several supported codings are equally preferable, the server
+      picks its own preference. ``Vary: Accept-Encoding`` is added to
+      the response (once) so caches key on the request header.
+
+      Compression is skipped for responses without a representation
+      (1xx, 204, 304), for partial (``Range``) responses, and when
+      ``Content-Encoding`` is already set. If the response carries a
+      strong ``ETag``, it is downgraded to a weak validator when
+      compression is applied, since the representation data changes;
+      weak validators are left untouched.
+
       *strategy* accepts a :mod:`zlib` compression strategy.
       See :func:`zlib.compressobj` for possible values, or refer to the
       docs for the zlib of your using, should you use :func:`aiohttp.set_zlib_backend`

@@ -1413,3 +1413,33 @@ async def test_sendfile_after_client_disconnect(
     request_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await request_task
+
+
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_static_file_range_request_not_compressed(
+    hello_txt: pathlib.Path,
+    aiohttp_client: AiohttpClient,
+    sender: _Sender,
+) -> None:
+    """A Range response must not be compressed and keeps the range length."""
+
+    async def handler(request: web.Request) -> web.FileResponse:
+        resp = sender(hello_txt)
+        resp.enable_compression()
+        return resp
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    client = await aiohttp_client(app, auto_decompress=False)
+
+    resp = await client.get(
+        "/", headers={"Accept-Encoding": "gzip", "Range": "bytes=0-4"}
+    )
+    assert resp.status == 206
+    assert "Content-Encoding" not in resp.headers
+    assert resp.headers["Content-Length"] == "5"
+    assert resp.headers["Content-Range"] == f"bytes 0-4/{len(HELLO_AIOHTTP)}"
+    assert await resp.read() == HELLO_AIOHTTP[:5]
+    resp.release()
+
+    await client.close()
