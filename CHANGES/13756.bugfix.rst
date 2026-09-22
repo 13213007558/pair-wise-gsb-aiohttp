@@ -1,0 +1,7 @@
+Fixed the pure-Python HTTP parser measuring header fields against
+``max_line_size`` instead of ``max_field_size`` when a field was split
+across multiple reads: the limit is now accounted on the accumulated
+on-wire bytes, matching the Cython parser. Also made
+:meth:`~aiohttp.http_parser.HttpParser.feed_eof` terminal -- it clears the
+buffered partial message, so a duplicate EOF cannot re-parse the same
+bytes into a second message -- by :user:`aiohttp-maintainers`.

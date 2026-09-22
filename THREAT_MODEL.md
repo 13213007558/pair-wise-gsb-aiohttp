@@ -272,6 +272,41 @@ into `StreamReader`) is then handed to `web_protocol.RequestHandler` and
 | 1.13 | llhttp version drift | Manual upgrade via `make generate-llhttp`; vendor pinned in `vendor/llhttp/package.json`. | Track upstream releases (e.g. via Dependabot rule for `vendor/llhttp/package.json`), bump on every llhttp release, regenerate in CI. |
 | 1.14 | npm-side compromise of `llhttp` | The vendored output is checked into git, so a compromise during a future regen would be detectable in PR review. See [§5.19](#519-build--release-supply-chain). | **Make the llhttp build reproducible: pin Node.js version, commit the npm lockfile, and on every bump verify the regenerated C against upstream's release tarballs before committing.** |
 
+**Parser state table (limits, error classes, connection action).**
+
+Every limit is accounted on on-wire bytes accumulated across reads
+(a field or line split over several TCP segments is measured whole).
+Each over-limit / illegal-field condition maps to exactly one exception
+class and one connection action; "close" means the connection is closed
+after the error response per the keep-alive / upgrade rules, and no
+already-parsed body or payload from the failed message is handed to the
+application.
+
+| Condition (on-wire) | Exception | Connection action |
+| :--- | :--- | :--- |
+| Request / status line exceeds `max_line_size` (incl. fragmented) | `LineTooLong` | close |
+| Header field exceeds `max_field_size` (incl. fragmented / buffered tail) | `LineTooLong` | close |
+| Header line count exceeds `max_headers` | `BadHttpMessage` ("Too many headers") | close |
+| Trailer field exceeds `max_field_size` / trailer count exceeds remaining `max_headers` | `LineTooLong` / `BadHttpMessage` | close |
+| Duplicate singleton header (strict request parser) | `BadHttpMessage` ("Duplicate ... header") | close |
+| `Content-Length` and `Transfer-Encoding` both present | `BadHttpMessage` | close |
+| `Content-Length` not a plain decimal sequence | `InvalidHeader` | close |
+| Duplicate `chunked` / final transfer coding not `chunked` (request) | `BadHttpMessage` | close |
+| obs-fold (strict request parser) | `InvalidHeader` | close |
+| Illegal token in header name / method / request-target CTL | `InvalidHeader` / `BadHttpMethod` / `InvalidURLError` | close |
+| Bare LF where CRLF is required | `BadHttpMessage` | close |
+| LF in chunk-extension / non-hex chunk size / missing CRLF after chunk data | `TransferEncodingError` | close |
+| `Sec-WebSocket-Key1` (legacy handshake) present | `InvalidHeader` | close |
+| Data after `Connection: close` | `BadHttpMessage` | close |
+| EOF with incomplete `Content-Length` body | `ContentLengthError` | already closed by peer |
+| EOF with incomplete chunked body | `TransferEncodingError` | already closed by peer |
+| EOF mid-headers | partial message discarded; only a complete message is emitted, at most once | already closed by peer |
+
+EOF is terminal: `feed_eof()` clears the buffered partial message and
+the payload parser, so a duplicate `feed_eof()` / `connection_lost()`
+cannot re-emit a message, and pipelined bytes behind the failed message
+are never parsed into a new request.
+
 **Past advisories / hardening (recap).**
 
 - **GHSA-xx9p-xxvh-7g8j (CVE-2023-47641)** (3.8.0) — CL-vs-TE divergence
@@ -331,6 +366,12 @@ into `StreamReader`) is then handed to `web_protocol.RequestHandler` and
   Now rejected at the point it is seen, matching llhttp (request line,
   headers, chunk-size, trailers). Not a vulnerability because no proxy would
   pipeline requests from multiple clients and forward raw LFs to the backend.
+- **PR #13756** — the pure-Python parser measured a header field split
+  across multiple reads against `max_line_size` instead of
+  `max_field_size`; limits are now accounted on the accumulated
+  on-wire bytes, matching the Cython parser. `feed_eof()` is now
+  terminal: the buffered partial message is cleared, so a duplicate EOF
+  cannot re-parse the same bytes into a second message.
 
 These are all currently in place; this section assumes no regression.
 

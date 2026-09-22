@@ -319,12 +319,19 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
             # try to extract partial message
             if self._tail:
                 self._lines.append(self._tail)
+                self._tail = b""
 
             if self._lines:
                 if self._lines[-1] != "\r\n":
                     self._lines.append(b"")
-                with suppress(Exception):
-                    return self.parse_message(self._lines)
+                try:
+                    with suppress(Exception):
+                        return self.parse_message(self._lines)
+                finally:
+                    # EOF is terminal: drop the buffered partial message so a
+                    # second feed_eof() cannot re-parse the same bytes into a
+                    # duplicate message.
+                    self._lines.clear()
         return None
 
     def feed_data(
@@ -344,7 +351,10 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
         data_len = len(data)
         start_pos = 0
         loop = self.loop
-        max_line_length = self.max_line_size
+        # Lines buffered by a previous feed_data() call mean we are in the
+        # middle of the header block, so the field-size limit applies to
+        # every further line, including one split across reads.
+        max_line_length = self.max_field_size if self._lines else self.max_line_size
 
         should_close = False
         while start_pos < data_len or self._payload_has_more_data:
@@ -526,8 +536,8 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
                     # bytes get appended to this line and leak in the error.
                     if b"\n" in self._tail:
                         raise BadHttpMessage("Bad line ending, expected CRLF")
-                    if len(self._tail) > self.max_line_size:
-                        raise LineTooLong(self._tail[:100] + b"...", self.max_line_size)
+                    if len(self._tail) > max_line_length:
+                        raise LineTooLong(self._tail[:100] + b"...", max_line_length)
                     data = EMPTY
                     break
 

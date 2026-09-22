@@ -340,6 +340,87 @@ def test_partial_request_split_still_parses(parser: HttpRequestParser) -> None:
     assert messages[0][0].path == "/split"
 
 
+def test_max_field_size_enforced_across_fragmented_reads(
+    request_cls: type[HttpRequestParser],
+    protocol: BaseProtocol,
+    event_loop: asyncio.AbstractEventLoop,
+) -> None:
+    """max_field_size applies to on-wire bytes, even split across reads.
+
+    A header field that arrives in several feed_data() calls must be
+    rejected once its accumulated size exceeds max_field_size, exactly as
+    if it had arrived in a single read.
+    """
+    parser = request_cls(
+        protocol,
+        event_loop,
+        2**16,
+        max_line_size=8190,
+        max_field_size=100,
+    )
+    protocol._parser = parser
+    parser.feed_data(b"GET / HTTP/1.1\r\nHost: a\r\n")
+    parser.feed_data(b"X-Big: " + b"a" * 60)
+    with pytest.raises(http_exceptions.LineTooLong):
+        parser.feed_data(b"a" * 60 + b"\r\n\r\n")
+
+
+def test_max_field_size_enforced_on_fragmented_tail(
+    request_cls: type[HttpRequestParser],
+    protocol: BaseProtocol,
+    event_loop: asyncio.AbstractEventLoop,
+) -> None:
+    """A header field still in the tail is capped by max_field_size."""
+    parser = request_cls(
+        protocol,
+        event_loop,
+        2**16,
+        max_line_size=8190,
+        max_field_size=100,
+    )
+    protocol._parser = parser
+    parser.feed_data(b"GET / HTTP/1.1\r\n")
+    with pytest.raises(http_exceptions.LineTooLong):
+        parser.feed_data(b"X-Big: " + b"a" * 200)
+
+
+def test_response_max_field_size_enforced_across_fragmented_reads(
+    response_cls: type[HttpResponseParser],
+    event_loop: asyncio.AbstractEventLoop,
+) -> None:
+    """The response parser applies max_field_size to fragmented fields."""
+    protocol = ResponseHandler(event_loop)
+    parser = response_cls(
+        protocol,
+        event_loop,
+        2**16,
+        max_line_size=8190,
+        max_field_size=100,
+    )
+    protocol._parser = parser
+    parser.feed_data(b"HTTP/1.1 200 OK\r\n")
+    parser.feed_data(b"X-Big: " + b"a" * 60)
+    with pytest.raises(http_exceptions.LineTooLong):
+        parser.feed_data(b"a" * 60 + b"\r\n\r\n")
+
+
+def test_feed_eof_is_final(parser: HttpRequestParser) -> None:
+    """EOF finalizes the parser once; a second feed_eof() re-parses nothing."""
+    parser.feed_data(b"GET / HTTP/1.0\r\n")  # no blank line: stays in the tail
+    msg = parser.feed_eof()
+    assert msg is not None
+    assert msg.method == "GET"
+    assert parser.feed_eof() is None
+
+
+def test_feed_eof_after_completed_message(parser: HttpRequestParser) -> None:
+    """feed_eof() after a fully parsed message is a no-op, even twice."""
+    messages, _, _ = parser.feed_data(b"GET / HTTP/1.0\r\n\r\n")
+    assert len(messages) == 1
+    assert parser.feed_eof() is None
+    assert parser.feed_eof() is None
+
+
 @pytest.mark.parametrize(
     "attacker",
     (

@@ -624,6 +624,9 @@ cdef class HttpParser:
                 self._more_data_available = False
                 self._eof_pending = False
         elif self._started:
+            # EOF is terminal: clear _started so a second feed_eof() cannot
+            # re-emit the same partial message.
+            self._started = False
             self._on_headers_complete()
             if self._messages:
                 return self._messages[-1][0]
