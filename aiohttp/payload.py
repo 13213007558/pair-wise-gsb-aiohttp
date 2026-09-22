@@ -7,7 +7,7 @@ import os
 import sys
 import warnings
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterable, AsyncIterator, Iterable
+from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterable
 from itertools import chain
 from typing import IO, Any, Final, TextIO
 
@@ -142,6 +142,7 @@ class Payload(ABC):
     _size: int | None = None
     _consumed: bool = False  # Default: payload has not been consumed yet
     _autoclose: bool = False  # Default: assume resource needs explicit closing
+    _closed: bool = False  # Default: close() has not run yet
 
     def __init__(
         self,
@@ -332,8 +333,15 @@ class Payload(ABC):
         immediately, as it may be called during cleanup/cancellation. Schedule
         any long-running operations without awaiting them.
 
+        This method must be idempotent: it may be called more than once
+        (e.g. from the request cleanup path and from user code) and only the
+        first call may have an effect.
+
         In the future, this will be the only close method supported.
         """
+        if self._closed:
+            return
+        self._closed = True
         self._close()
 
 
@@ -1053,10 +1061,14 @@ class AsyncIterablePayload(Payload):
         # payload consumed up front so an interrupted write cannot be replayed
         # from a partially drained iterator.
         self._consumed = True
+        # Iterate over a local reference: close() may detach self._iter while
+        # this write is in flight, and the local reference keeps the loop
+        # well-defined in that case.
+        iterator = self._iter
 
         try:
             while True:
-                chunk = await anext(self._iter)
+                chunk = await anext(iterator)
                 if remaining_bytes is None:
                     await writer.write(chunk)
                 # If we have a content length limit
@@ -1070,6 +1082,34 @@ class AsyncIterablePayload(Payload):
         except StopAsyncIteration:
             # Iterator is exhausted
             self._iter = None
+
+    async def close(self) -> None:
+        """
+        Close the payload, releasing the underlying async iterator exactly once.
+
+        If the iterator is an async generator, its aclose() is awaited so
+        that finally blocks in the producer run deterministically.  When
+        the generator is currently running (e.g. a writer task is suspended
+        inside anext() and has not unwound yet), it is left to the task
+        that drives it: the generator is finalized when the in-flight
+        anext() unwinds, so it is still closed exactly once.
+
+        This method is idempotent: concurrent or repeated calls have no
+        additional effect.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        iterator, self._iter = self._iter, None
+        if iterator is None:
+            return
+        if isinstance(iterator, AsyncGenerator):
+            if not iterator.ag_running:
+                await iterator.aclose()
+        else:
+            aclose = getattr(iterator, "aclose", None)
+            if aclose is not None:
+                await aclose()
 
     def decode(self, encoding: str = "utf-8", errors: str = "strict") -> str:
         """Decode the payload content as a string if cached chunks are available."""

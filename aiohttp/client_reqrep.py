@@ -28,6 +28,7 @@ from .base_protocol import BaseProtocol
 from .client_exceptions import (
     ClientConnectionError,
     ClientOSError,
+    ClientPayloadError,
     ClientResponseError,
     ContentTypeError,
     InvalidURL,
