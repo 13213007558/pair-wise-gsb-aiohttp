@@ -12,7 +12,7 @@ from collections.abc import Callable, Iterable, Sequence
 from hashlib import md5, sha1, sha256
 from http.cookies import BaseCookie, SimpleCookie
 from types import MappingProxyType, TracebackType
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict
+from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple, TypedDict
 
 from multidict import CIMultiDict, CIMultiDictProxy, MultiDict, MultiDictProxy
 from yarl import URL, Query
@@ -28,6 +28,7 @@ from .base_protocol import BaseProtocol
 from .client_exceptions import (
     ClientConnectionError,
     ClientOSError,
+    ClientPayloadError,
     ClientResponseError,
     ContentTypeError,
     InvalidURL,
@@ -59,6 +60,7 @@ from .http import (
     HttpVersion11,
     StreamWriter,
 )
+from .log import client_logger
 from .streams import EMPTY_PAYLOAD, StreamReader
 from .typedefs import DEFAULT_JSON_DECODER, JSONDecoder, RawHeaders
 
@@ -80,6 +82,12 @@ if TYPE_CHECKING:
 
 
 _CONNECTION_CLOSED_EXCEPTION = ClientConnectionError("Connection closed")
+
+# Upper bound on the number of bytes ClientResponse.release() will read
+# and discard from an unconsumed response body in order to return the
+# underlying connection to the pool for reuse. If the remaining body is
+# larger, the connection is closed instead of being drained.
+MAX_DRAIN_SIZE: Final = 2**20  # 1 MiB
 _CONTAINS_CONTROL_CHAR_RE = re.compile(r"[^-!#$%&'*+.^_`|~0-9a-zA-Z]")
 _DIGITS_RE = re.compile(r"\d+", re.ASCII)
 _LINK_PARAM_RE = re.compile(r"^([^\s=]+)\s*=\s*(?:(['\"])(.*?)\2|(\S*))$", re.M)
@@ -272,6 +280,7 @@ class ClientResponse(HeadersMixin):
     _closed = True  # to allow __del__ for non-initialized properly response
     _released = False
     _in_context = False
+    _drain_task: asyncio.Task[None] | None = None
 
     _resolve_charset: Callable[["ClientResponse", bytes], str] = lambda *_: "utf-8"
 
@@ -589,6 +598,9 @@ class ClientResponse(HeadersMixin):
             self._notify_content()
 
         self._closed = True
+        if self._drain_task is not None:
+            self._drain_task.cancel()
+            self._drain_task = None
         if self._loop.is_closed():
             return
 
@@ -598,13 +610,79 @@ class ClientResponse(HeadersMixin):
             self._connection = None
 
     def release(self) -> None:
-        if not self._released:
-            self._notify_content()
-
+        if self._released:
+            # Already released (or draining); releasing is idempotent.
+            return
         self._closed = True
-
         self._cleanup_writer()
+        if self._connection is not None and self._can_drain():
+            # The body was not fully consumed, but the connection is
+            # healthy and the remaining tail may be small: drain it in
+            # the background so the connection can be returned to the
+            # pool at a reusable boundary instead of being closed.
+            # The connection is closed instead if the drain fails
+            # (oversized tail, parse/decompress error, peer disconnect).
+            self._released = True
+            content = self.content
+            if content._on_chunk_received is not None:
+                # Break the response->payload->method->self cycle and
+                # stop trace hooks for a body nobody consumes anymore.
+                content._on_chunk_received = None
+            self._drain_task = self._loop.create_task(self._drain_and_release())
+            return
+        self._notify_content()
         self._release_connection()
+
+    def _can_drain(self) -> bool:
+        """Check if the unconsumed body may be drained for connection reuse."""
+        content = self.content
+        if (
+            content is None
+            or content is EMPTY_PAYLOAD
+            or content.is_eof()
+            or content.exception() is not None
+            or self._loop.is_closed()
+        ):
+            return False
+        connection = self._connection
+        protocol = connection and connection.protocol
+        if protocol is None or protocol.upgraded or protocol.must_close:
+            return False
+        return True
+
+    async def _drain_and_release(self) -> None:
+        """Read and discard the rest of the payload, then release the connection.
+
+        The connection is returned to the pool only if the remaining body
+        arrives cleanly and stays within MAX_DRAIN_SIZE; on any failure
+        (parse or decompression error, early disconnect, oversized tail,
+        cancellation) the connection is closed instead, so an unconsumed
+        tail can never be mistaken for the next response.
+        """
+        content = self.content
+        remaining = MAX_DRAIN_SIZE
+        try:
+            while True:
+                chunk = await content.readany()
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                if remaining < 0:
+                    raise ClientPayloadError(
+                        "Response body too large to drain for connection reuse"
+                    )
+        except asyncio.CancelledError:
+            if self._connection is not None:
+                self._connection.close()
+                self._connection = None
+            raise
+        except Exception as exc:
+            client_logger.debug("Draining response body failed: %r", exc)
+            if self._connection is not None:
+                self._connection.close()
+                self._connection = None
+        else:
+            self._release_connection()
 
     @property
     def ok(self) -> bool:
@@ -686,6 +764,16 @@ class ClientResponse(HeadersMixin):
                     and task.cancelling()
                 ):
                     raise
+        if self._drain_task is not None:
+            try:
+                await self._drain_task
+            except asyncio.CancelledError:
+                if (
+                    sys.version_info >= (3, 11)
+                    and (task := asyncio.current_task())
+                    and task.cancelling()
+                ):
+                    raise
         self.release()
 
     async def _on_chunk_response_received(self, chunk: bytes) -> None:
@@ -699,6 +787,8 @@ class ClientResponse(HeadersMixin):
     async def read(self) -> bytes:
         """Read response payload."""
         if self._body is None:
+            if self._released:  # Response explicitly released
+                raise ClientConnectionError("Connection closed")
             try:
                 self._body = await self.content.read()
             except BaseException:

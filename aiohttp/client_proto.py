@@ -90,6 +90,22 @@ class ResponseHandler(BaseProtocol, DataQueue[tuple[RawResponseMessage, StreamRe
             or self._tail
         )
 
+    @property
+    def must_close(self) -> bool:
+        """True if the connection can never be reused for another request.
+
+        Unlike should_close, this ignores the state of the in-flight
+        payload: a response that is merely not fully consumed yet may
+        still be drained to a reusable boundary, while the conditions
+        checked here are unrecoverable for keep-alive.
+        """
+        return bool(
+            self._should_close
+            or self._upgraded
+            or self._exception is not None
+            or self._payload_parser is not None
+        )
+
     def force_close(self) -> None:
         self._should_close = True
 
