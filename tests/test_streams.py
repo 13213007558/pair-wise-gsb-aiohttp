@@ -1955,3 +1955,59 @@ async def test_readany_does_not_drain_reentrant_refill(
     assert await stream.readany() == b"first"
     assert await stream.readany() == b"second"
     assert await stream.readany() == b"third"
+
+
+async def test_drain_discards_buffered_data(
+    protocol: mock.Mock, loop: asyncio.AbstractEventLoop
+) -> None:
+    stream = streams.StreamReader(protocol, DEFAULT_CHUNK_SIZE, loop=loop)
+    stream.feed_data(b"hello ")
+    stream.feed_data(b"world")
+    assert stream._size == 11
+
+    stream.drain()
+
+    assert stream._size == 0
+    assert not stream._buffer
+    stream.feed_eof()
+    assert await stream.read() == b""
+
+
+async def test_drain_resets_flow_control_headroom(
+    protocol: mock.Mock, loop: asyncio.AbstractEventLoop
+) -> None:
+    stream = streams.StreamReader(protocol, 2**10, loop=loop)
+    stream.feed_data(b"x" * (2**11 + 1))
+    protocol.pause_reading.assert_called()
+
+    stream.drain()
+
+    assert stream._size == 0
+    stream.feed_data(b"x" * 10)
+    assert len(protocol.pause_reading.mock_calls) == 1
+
+
+async def test_drain_advances_cursor_and_drops_chunk_splits(
+    protocol: mock.Mock, loop: asyncio.AbstractEventLoop
+) -> None:
+    stream = streams.StreamReader(protocol, DEFAULT_CHUNK_SIZE, loop=loop)
+    stream.begin_http_chunk_receiving()
+    stream.feed_data(b"data")
+    stream.end_http_chunk_receiving()
+    assert stream._http_chunk_splits
+
+    stream.drain()
+
+    assert stream._cursor == 4
+    assert not stream._http_chunk_splits
+    # The stream keeps consistent bookkeeping for the next chunks.
+    stream.begin_http_chunk_receiving()
+    stream.feed_data(b"more")
+    stream.end_http_chunk_receiving()
+    stream.feed_eof()
+    chunk, end = await stream.readchunk()
+    assert (chunk, end) == (b"more", True)
+
+
+async def test_drain_empty_stream_reader() -> None:
+    streams.EMPTY_PAYLOAD.drain()  # no-op, must not raise

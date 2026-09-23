@@ -132,6 +132,7 @@ async def named_pipe_server(
 def create_mocked_conn(
     conn_closing_result: asyncio.AbstractEventLoop | None = None,
     should_close: bool = True,
+    can_drain: bool = False,
     **kwargs: object,
 ) -> mock.Mock:
     assert "loop" not in kwargs
@@ -142,7 +143,11 @@ def create_mocked_conn(
 
     f = loop.create_future()
     proto: mock.Mock = mock.create_autospec(
-        ResponseHandler, instance=True, should_close=should_close, closed=f
+        ResponseHandler,
+        instance=True,
+        should_close=should_close,
+        can_drain=can_drain,
+        closed=f,
     )
     f.set_result(conn_closing_result)
     return proto
@@ -1794,6 +1799,108 @@ async def test_release_not_opened(key: ConnectionKey) -> None:
     assert proto.close.called
 
     await conn.close()
+
+
+async def test_release_starts_drain_for_unfinished_payload(
+    key: ConnectionKey,
+) -> None:
+    """A connection with a drainable tail is drained, not closed."""
+    conn = aiohttp.BaseConnector()
+    proto = create_mocked_conn(
+        asyncio.get_running_loop(), should_close=True, can_drain=True
+    )
+    conn._acquired.add(proto)
+
+    conn._release(key, proto)
+
+    assert proto in conn._draining
+    assert proto.start_drain.called
+    assert not proto.close.called
+    assert not conn._conns
+    await conn.close()
+
+
+async def test_release_closes_when_not_drainable(key: ConnectionKey) -> None:
+    conn = aiohttp.BaseConnector()
+    proto = create_mocked_conn(
+        asyncio.get_running_loop(), should_close=True, can_drain=False
+    )
+    conn._acquired.add(proto)
+
+    conn._release(key, proto)
+
+    assert proto not in conn._draining
+    assert not proto.start_drain.called
+    assert proto.close.called
+    await conn.close()
+
+
+async def test_release_force_close_never_drains(key: ConnectionKey) -> None:
+    conn = aiohttp.BaseConnector(force_close=True)
+    proto = create_mocked_conn(
+        asyncio.get_running_loop(), should_close=True, can_drain=True
+    )
+    conn._acquired.add(proto)
+
+    conn._release(key, proto)
+
+    assert proto not in conn._draining
+    assert proto.close.called
+    await conn.close()
+
+
+async def test_drain_done_returns_connection_to_pool(key: ConnectionKey) -> None:
+    conn = aiohttp.BaseConnector()
+    proto = create_mocked_conn(
+        asyncio.get_running_loop(), should_close=True, can_drain=True
+    )
+    conn._acquired.add(proto)
+    conn._release(key, proto)
+    assert proto in conn._draining
+
+    # The tail reached EOF: the protocol is clean again.
+    proto.should_close = False
+    conn._drain_done(key, proto, True)
+
+    assert proto not in conn._draining
+    assert not proto.close.called
+    rec = conn._conns[key]
+    assert rec and rec[0][0] is proto
+    await conn.close()
+
+
+async def test_drain_done_failure_closes_connection(key: ConnectionKey) -> None:
+    conn = aiohttp.BaseConnector()
+    proto = create_mocked_conn(
+        asyncio.get_running_loop(), should_close=True, can_drain=True
+    )
+    conn._acquired.add(proto)
+    conn._release(key, proto)
+    assert proto in conn._draining
+
+    conn._drain_done(key, proto, False)
+
+    assert proto not in conn._draining
+    assert proto.close.called
+    assert not conn._conns
+    await conn.close()
+
+
+async def test_connector_close_reaps_draining_connections(
+    key: ConnectionKey,
+) -> None:
+    conn = aiohttp.BaseConnector()
+    proto = create_mocked_conn(
+        asyncio.get_running_loop(), should_close=True, can_drain=True
+    )
+    conn._acquired.add(proto)
+    conn._release(key, proto)
+    assert proto in conn._draining
+
+    await conn.close()
+
+    assert proto.close.called
+    assert not conn._draining
 
 
 async def test_connect(key: ConnectionKey, make_client_request: _RequestMaker) -> None:

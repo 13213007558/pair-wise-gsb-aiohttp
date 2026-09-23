@@ -252,6 +252,7 @@ into `StreamReader`) is then handed to `web_protocol.RequestHandler` and
 | 1.12 | Cython ⇄ pure-Python divergence | T / S | Behaviour differences between llhttp and the Python fallback may produce parser-confusion if a deployment unintentionally switches backends (e.g. a user installs without compiled extensions). | Med |
 | 1.13 | Vendored llhttp version drift | S / T | An upstream llhttp CVE not picked up by aiohttp's vendoring cadence remains exploitable until `make generate-llhttp` is re-run and released. | Medium |
 | 1.14 | Build/regen of llhttp (`make generate-llhttp`) | S / T | Local tampering or supply-chain compromise of the npm `llhttp` package gets baked into the vendored C. Covered in [§5.19](#519-build--release-supply-chain) but originates here. | Medium |
+| 1.15 | Drain-on-release buffer (client) | D | A response released with an unread tail is drained in the background so the connection can be reused; a peer that streams an endless tail could hold the connection and its buffer. Bounded by `MAX_DRAIN_SIZE` (64 KiB) in `client_proto.py`, the read timeout, and `connector.close()`. | Low |
 
 **Mitigations.**
 
@@ -271,6 +272,7 @@ into `StreamReader`) is then handed to `web_protocol.RequestHandler` and
 | 1.12 | Cython ⇄ pure-Python divergence | `tests/test_http_parser.py` parameterises tests over `REQUEST_PARSERS` / `RESPONSE_PARSERS` (pure-Python always; Cython when the extension imports). The high-leverage attack vectors are already covered under both backends: CL+TE (`test_content_length_transfer_encoding`), CL×N (`test_duplicate_singleton_header_rejected`), obs-fold (`test_reject_obsolete_line_folding`, `test_http_response_parser_obs_line_folding*`), CR/LF/NUL (`test_bad_headers`, `test_http_response_parser_null_byte_in_header_value`, `test_http_response_parser_bad_crlf`), version regex (`test_http_request_parser_bad_version*`, `test_http_response_parser_bad_version*`), bare-LF line endings (`test_reject_bare_lf_no_cross_request_leak`), control characters in the request target (`test_http_request_parser_ctl_in_request_target`). | None. When new attack vectors emerge, add them to the parameterised tests. |
 | 1.13 | llhttp version drift | Manual upgrade via `make generate-llhttp`; vendor pinned in `vendor/llhttp/package.json`. | Track upstream releases (e.g. via Dependabot rule for `vendor/llhttp/package.json`), bump on every llhttp release, regenerate in CI. |
 | 1.14 | npm-side compromise of `llhttp` | The vendored output is checked into git, so a compromise during a future regen would be detectable in PR review. See [§5.19](#519-build--release-supply-chain). | **Make the llhttp build reproducible: pin Node.js version, commit the npm lockfile, and on every bump verify the regenerated C against upstream's release tarballs before committing.** |
+| 1.15 | Drain-on-release buffer | The drain discards into the abandoned payload stream and aborts to a close once the tail exceeds `MAX_DRAIN_SIZE`; decompression stays bounded by the existing `max_decompress_size` machinery, and draining connections are reaped by `BaseConnector.close()`. | None. |
 
 **Past advisories / hardening (recap).**
 

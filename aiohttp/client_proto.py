@@ -28,6 +28,17 @@ from .streams import EMPTY_PAYLOAD, DataQueue, StreamReader
 class _Payload(ErrorableProtocol, Protocol):
     def is_eof(self) -> bool: ...
 
+    def drain(self) -> None: ...
+
+    @property
+    def total_bytes(self) -> int: ...
+
+
+# Maximum size of an unread response tail that may be drained so the
+# connection can be reused.  A larger tail is cheaper to abandon:
+# the connection is closed and a fresh one is opened instead.
+MAX_DRAIN_SIZE = 2**16  # 64 KiB
+
 
 class ResponseHandler(BaseProtocol, DataQueue[tuple[RawResponseMessage, StreamReader]]):
     """Helper class to adapt between Protocol and StreamReader."""
@@ -55,6 +66,10 @@ class ResponseHandler(BaseProtocol, DataQueue[tuple[RawResponseMessage, StreamRe
 
         self._closed: None | asyncio.Future[None] = None
         self._connection_lost_called = False
+
+        self._draining = False
+        self._drain_on_done: Callable[[ResponseHandler, bool], None] | None = None
+        self._drain_start_bytes = 0
 
     @property
     def closed(self) -> None | asyncio.Future[None]:
@@ -89,6 +104,64 @@ class ResponseHandler(BaseProtocol, DataQueue[tuple[RawResponseMessage, StreamRe
             or self._buffer
             or self._tail
         )
+
+    @property
+    def can_drain(self) -> bool:
+        """Whether the connection can be reused after draining the unread tail.
+
+        True only when an unfinished response payload is the sole obstacle
+        to reuse: no error, no upgrade, no queued messages and no parser tail.
+        """
+        return (
+            self._payload is not None
+            and not self._payload.is_eof()
+            and not self._should_close
+            and self._exception is None
+            and not self._upgraded
+            and self._payload_parser is None
+            and self._parser is not None
+            and not self._buffer
+            and not self._tail
+        )
+
+    def start_drain(self, on_done: Callable[["ResponseHandler", bool], None]) -> None:
+        """Drain a small unread response tail so the connection can be reused.
+
+        The remaining payload is discarded as it arrives; *on_done* is
+        called with True once the payload reaches EOF within the drain
+        limit, or with False if the tail is too large or the connection
+        breaks first.
+        """
+        payload = self._payload
+        assert payload is not None
+        self._draining = True
+        self._drain_on_done = on_done
+        self._drain_start_bytes = payload.total_bytes
+        payload.drain()
+        # Resume a transport paused by flow control and pump any
+        # parser-pending data so the drain cannot stall.
+        self.resume_reading()
+
+    def _drain_check(self) -> None:
+        if not self._draining:
+            return
+        payload = self._payload
+        if payload is not None and payload.is_eof() and not self._should_close:
+            self._draining = False
+            on_done, self._drain_on_done = self._drain_on_done, None
+            assert on_done is not None
+            on_done(self, True)
+            return
+        if (
+            payload is None
+            or self._exception is not None
+            or self._should_close
+            or payload.total_bytes - self._drain_start_bytes > MAX_DRAIN_SIZE
+        ):
+            self._draining = False
+            on_done, self._drain_on_done = self._drain_on_done, None
+            assert on_done is not None
+            on_done(self, False)
 
     def force_close(self) -> None:
         self._should_close = True
@@ -189,6 +262,8 @@ class ResponseHandler(BaseProtocol, DataQueue[tuple[RawResponseMessage, StreamRe
         self._reading_paused = False
         self._buffer_paused = False
 
+        self._drain_check()
+
         super().connection_lost(reraised_exc)
 
     def eof_received(self) -> None:
@@ -228,6 +303,7 @@ class ResponseHandler(BaseProtocol, DataQueue[tuple[RawResponseMessage, StreamRe
         self._should_close = True
         self._drop_timeout()
         super().set_exception(exc, exc_cause)
+        self._drain_check()
 
     def set_parser(
         self,
@@ -404,3 +480,6 @@ class ResponseHandler(BaseProtocol, DataQueue[tuple[RawResponseMessage, StreamRe
 
         if upgraded and tail:
             self.data_received(tail)
+
+        if self._draining:
+            self._drain_check()

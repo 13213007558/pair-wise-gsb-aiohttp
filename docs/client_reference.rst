@@ -1657,8 +1657,16 @@ Response object
 
       It is not required to call `release` on the response
       object. When the client fully receives the payload, the
-      underlying connection automatically returns back to pool. If the
-      payload is not fully read, the connection is closed
+      underlying connection automatically returns back to pool.
+
+      If the payload is not fully read, the remaining tail is
+      drained in the background and the connection returns back to
+      pool once the payload reaches its end, provided the tail is
+      small enough to drain safely. If the tail is too large, or a
+      parsing or decompression error occurred, or the server
+      disconnected early, the connection is closed instead.
+
+      Use :meth:`close` to close the connection unconditionally.
 
    .. method:: raise_for_status()
 

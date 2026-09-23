@@ -219,6 +219,18 @@ Helpers
       E.g. :meth:`~StreamReader.read` will not be resumed.
 
 
+.. method:: StreamReader.drain()
+
+   Discard any buffered data without consuming it.
+
+   Used when a response is released with an unread tail: the buffered
+   remainder is abandoned so the connection can be drained to a clean
+   boundary and returned to the pool.
+
+   .. note:: The method does not wake up waiters and does not affect
+      data that has not been received yet.
+
+
 .. method:: wait_eof()
       :async:
 

@@ -282,6 +282,25 @@ class StreamReader:
         self._buffer.appendleft(data)
         self._eof_counter = 0
 
+    def drain(self) -> None:
+        """Discard any buffered data without consuming it.
+
+        Used when a response is released with an unread tail: the
+        buffered remainder is abandoned so the connection can be
+        drained to a clean boundary and returned to the pool.
+        """
+        discarded = self._size
+        if not discarded:
+            return
+        self._buffer.clear()
+        self._buffer_offset = 0
+        self._size = 0
+        self._cursor += discarded
+        chunk_splits = self._http_chunk_splits
+        if chunk_splits is not None:
+            while chunk_splits and chunk_splits[0] <= self._cursor:
+                chunk_splits.popleft()
+
     def feed_data(self, data: bytes) -> bool:
         assert not self._eof, "feed_data after feed_eof"
 
@@ -649,6 +668,9 @@ class EmptyStreamReader(StreamReader):  # lgtm [py/missing-call-to-init]
 
     def feed_data(self, data: bytes) -> bool:
         return False
+
+    def drain(self) -> None:
+        """Nothing to discard, the stream is always empty."""
 
     def set_read_chunk_size(self, n: int) -> None:
         return

@@ -364,6 +364,9 @@ class BaseConnector:
         self._acquired_per_host: defaultdict[ConnectionKey, set[ResponseHandler]] = (
             defaultdict(set)
         )
+        # Connections draining an unread response tail before they can
+        # be returned to the pool; tracked so close() can reap them.
+        self._draining: set[ResponseHandler] = set()
         self._keepalive_timeout = cast(float, keepalive_timeout)
         self._force_close = force_close
 
@@ -578,6 +581,18 @@ class BaseConnector:
                 if closed := proto.closed:
                     waiters.append(closed)
 
+            for proto in tuple(self._draining):
+                if (
+                    abort_ssl
+                    and proto.transport
+                    and proto.transport.get_extra_info("sslcontext") is not None
+                ):
+                    proto.abort()
+                else:
+                    proto.close()
+                if closed := proto.closed:
+                    waiters.append(closed)
+
             # TODO (A.Yushovskiy, 24-May-2019) collect transp. closing futures
             for transport in self._cleanup_closed_transports:
                 if transport is not None:
@@ -588,6 +603,7 @@ class BaseConnector:
         finally:
             self._conns.clear()
             self._acquired.clear()
+            self._draining.clear()
             for keyed_waiters in self._waiters.values():
                 for keyed_waiter in keyed_waiters:
                     keyed_waiter.cancel()
@@ -849,6 +865,14 @@ class BaseConnector:
         self._release_acquired(key, protocol)
 
         if self._force_close or should_close or protocol.should_close:
+            if not should_close and not self._force_close and protocol.can_drain:
+                # The response was released with an unread tail and no other
+                # obstacle to reuse: drain the tail to a clean boundary and
+                # return the connection to the pool instead of closing it.
+                self._draining.add(protocol)
+                protocol.start_drain(functools.partial(self._drain_done, key))
+                return
+
             transport = protocol.transport
             protocol.close()
             if key.is_ssl and not self._cleanup_closed_disabled:
@@ -865,6 +889,15 @@ class BaseConnector:
                 self._loop,
                 timeout_ceil_threshold=self._timeout_ceil_threshold,
             )
+
+    def _drain_done(
+        self, key: "ConnectionKey", protocol: ResponseHandler, ok: bool
+    ) -> None:
+        self._draining.discard(protocol)
+        if self._closed:
+            protocol.close()
+            return
+        self._release(key, protocol, should_close=not ok)
 
     async def _create_connection(
         self, req: ClientRequest, traces: list["Trace"], timeout: "ClientTimeout"

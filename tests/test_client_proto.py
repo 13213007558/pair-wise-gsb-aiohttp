@@ -9,7 +9,7 @@ from yarl import URL
 from aiohttp import http
 from aiohttp.abc import AbstractStreamWriter
 from aiohttp.client_exceptions import ClientOSError, ServerDisconnectedError
-from aiohttp.client_proto import ResponseHandler
+from aiohttp.client_proto import MAX_DRAIN_SIZE, ResponseHandler
 from aiohttp.client_reqrep import ClientResponse
 from aiohttp.helpers import DEFAULT_CHUNK_SIZE, TimerNoop
 from aiohttp.http_parser import HttpParser, RawResponseMessage
@@ -646,3 +646,131 @@ async def test_drain_leaves_the_clock_stopped_for_a_flow_control_pause() -> None
     proto.set_parser(parser, mock.Mock())
 
     assert proto._read_timeout_handle is None
+
+
+async def test_can_drain_unfinished_payload() -> None:
+    """An unfinished payload with no other obstacle is drainable."""
+    proto = ResponseHandler(loop=asyncio.get_running_loop())
+    transport = mock.Mock()
+    proto.connection_made(transport)
+    proto.set_response_params()
+
+    proto.data_received(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n12345")
+    message, payload = await proto.read()
+    assert not payload.is_eof()
+    assert proto.can_drain
+
+
+async def test_cannot_drain_without_payload() -> None:
+    proto = ResponseHandler(loop=asyncio.get_running_loop())
+    transport = mock.Mock()
+    proto.connection_made(transport)
+    proto.set_response_params()
+    assert not proto.can_drain
+
+
+async def test_cannot_drain_completed_payload() -> None:
+    proto = ResponseHandler(loop=asyncio.get_running_loop())
+    transport = mock.Mock()
+    proto.connection_made(transport)
+    proto.set_response_params()
+
+    proto.data_received(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n12345")
+    message, payload = await proto.read()
+    assert payload.is_eof()
+    assert not proto.can_drain
+    assert not proto.should_close
+
+
+async def test_cannot_drain_after_error() -> None:
+    proto = ResponseHandler(loop=asyncio.get_running_loop())
+    transport = mock.Mock()
+    proto.connection_made(transport)
+    proto.set_response_params()
+
+    proto.data_received(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n12345")
+    await proto.read()
+    proto.set_exception(ValueError())
+    assert not proto.can_drain
+
+
+async def test_cannot_drain_when_upgraded() -> None:
+    proto = ResponseHandler(loop=asyncio.get_running_loop())
+    transport = mock.Mock()
+    proto.connection_made(transport)
+    proto.set_response_params()
+
+    proto.data_received(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n12345")
+    await proto.read()
+    proto._upgraded = True
+    assert not proto.can_drain
+
+
+async def test_start_drain_completes_at_payload_eof() -> None:
+    """A small tail is drained to EOF and reported as reusable."""
+    proto = ResponseHandler(loop=asyncio.get_running_loop())
+    transport = mock.Mock()
+    proto.connection_made(transport)
+    proto.set_response_params()
+
+    proto.data_received(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n12345")
+    message, payload = await proto.read()
+
+    results = []
+    proto.start_drain(lambda p, ok: results.append(ok))
+    # The unread buffered part is discarded, not delivered to the caller.
+    assert payload._size == 0
+
+    proto.data_received(b"67890")
+    assert results == [True]
+    assert payload.is_eof()
+    assert not proto.should_close
+
+
+async def test_drain_aborts_when_tail_too_large() -> None:
+    """A tail larger than the drain limit must not be reused."""
+    proto = ResponseHandler(loop=asyncio.get_running_loop())
+    transport = mock.Mock()
+    proto.connection_made(transport)
+    proto.set_response_params()
+
+    proto.data_received(b"HTTP/1.1 200 OK\r\nContent-Length: 200000\r\n\r\n12345")
+    message, payload = await proto.read()
+
+    results = []
+    proto.start_drain(lambda p, ok: results.append(ok))
+
+    proto.data_received(b"x" * (MAX_DRAIN_SIZE + 1))
+    assert results == [False]
+
+
+async def test_drain_aborts_on_error() -> None:
+    proto = ResponseHandler(loop=asyncio.get_running_loop())
+    transport = mock.Mock()
+    proto.connection_made(transport)
+    proto.set_response_params()
+
+    proto.data_received(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n12345")
+    await proto.read()
+
+    results = []
+    proto.start_drain(lambda p, ok: results.append(ok))
+    proto.set_exception(ValueError())
+    assert results == [False]
+
+
+async def test_drain_aborts_on_connection_lost() -> None:
+    """A peer disconnecting mid-drain must not leak the connection."""
+    proto = ResponseHandler(loop=asyncio.get_running_loop())
+    transport = mock.Mock()
+    proto.connection_made(transport)
+    proto.set_response_params()
+
+    proto.data_received(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n12345")
+    await proto.read()
+
+    results = []
+    proto.start_drain(lambda p, ok: results.append(ok))
+    proto.connection_lost(None)
+    assert results == [False]
+    assert proto.should_close

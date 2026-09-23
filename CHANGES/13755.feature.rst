@@ -1,0 +1,5 @@
+Releasing a response with a small unread tail now drains the remaining
+payload in the background and returns the connection to the pool for
+reuse instead of closing it; oversized tails, parse or decompression
+errors, and early server disconnects still close the connection
+-- by :user:`codex`.
