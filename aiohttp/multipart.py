@@ -82,6 +82,86 @@ class BadContentDispositionParam(RuntimeWarning):
     pass
 
 
+class _MultipartBudget:
+    """Tracks configurable limits shared by a whole multipart reader tree.
+
+    A single budget instance is shared by the root MultipartReader, all
+    nested multipart readers and all of their body part readers, so the
+    max_parts and max_total_* limits apply to the message as a whole
+    while the max_part_* limits are checked against per-part counters
+    supplied by each BodyPartReader.
+
+    All limits are optional; None disables a check.  Violations are
+    raised with error_cls (the max_size_error_cls of the root
+    reader), which keeps them distinguishable from malformed-input
+    ValueErrors and from connection errors raised by the stream.
+    """
+
+    __slots__ = (
+        "max_depth",
+        "max_parts",
+        "max_part_raw_size",
+        "max_part_size",
+        "max_total_raw_size",
+        "max_total_size",
+        "parts",
+        "total_raw_size",
+        "total_size",
+        "_error_cls",
+    )
+
+    def __init__(
+        self,
+        *,
+        max_depth: int | None = None,
+        max_parts: int | None = None,
+        max_part_raw_size: int | None = None,
+        max_part_size: int | None = None,
+        max_total_raw_size: int | None = None,
+        max_total_size: int | None = None,
+        error_cls: type[Exception] = ValueError,
+    ) -> None:
+        self.max_depth = max_depth
+        self.max_parts = max_parts
+        self.max_part_raw_size = max_part_raw_size
+        self.max_part_size = max_part_size
+        self.max_total_raw_size = max_total_raw_size
+        self.max_total_size = max_total_size
+        self.parts = 0
+        self.total_raw_size = 0
+        self.total_size = 0
+        self._error_cls = error_cls
+
+    def check_depth(self, depth: int) -> None:
+        if self.max_depth is not None and depth > self.max_depth:
+            raise self._error_cls(self.max_depth)
+
+    def enter_part(self) -> None:
+        self.parts += 1
+        if self.max_parts is not None and self.parts > self.max_parts:
+            raise self._error_cls(self.max_parts)
+
+    def add_raw(self, size: int, part_raw_size: int) -> None:
+        self.total_raw_size += size
+        if (
+            self.max_part_raw_size is not None
+            and part_raw_size > self.max_part_raw_size
+        ):
+            raise self._error_cls(self.max_part_raw_size)
+        if (
+            self.max_total_raw_size is not None
+            and self.total_raw_size > self.max_total_raw_size
+        ):
+            raise self._error_cls(self.max_total_raw_size)
+
+    def add_decoded(self, size: int, part_size: int) -> None:
+        self.total_size += size
+        if self.max_part_size is not None and part_size > self.max_part_size:
+            raise self._error_cls(self.max_part_size)
+        if self.max_total_size is not None and self.total_size > self.max_total_size:
+            raise self._error_cls(self.max_total_size)
+
+
 def parse_content_disposition(
     header: str | None,
 ) -> tuple[str | None, dict[str, str]]:
@@ -309,6 +389,7 @@ class BodyPartReader:
         max_decompress_size: int = DEFAULT_CHUNK_SIZE,
         client_max_size: int = sys.maxsize,
         max_size_error_cls: type[Exception] = ValueError,
+        budget: _MultipartBudget | None = None,
     ) -> None:
         self.headers = headers
         self._boundary = boundary
@@ -316,6 +397,7 @@ class BodyPartReader:
         self._content = content
         self._default_charset = default_charset
         self._at_eof = False
+        self._closed = False
         self._is_form_data = subtype == "form-data"
         # https://datatracker.ietf.org/doc/html/rfc7578#section-4.8
         length = None if self._is_form_data else self.headers.get(CONTENT_LENGTH, None)
@@ -326,6 +408,7 @@ class BodyPartReader:
             raise ValueError(f"invalid Content-Length: {length!r}")
         self._length = int(length) if length is not None else None
         self._read_bytes = 0
+        self._decoded_bytes = 0
         self._b64_carry = b""
         self._unread: deque[bytes] = deque()
         self._prev_chunk: bytes | None = None
@@ -334,6 +417,7 @@ class BodyPartReader:
         self._max_decompress_size = max_decompress_size
         self._client_max_size = client_max_size
         self._max_size_error_cls = max_size_error_cls
+        self._budget = budget
 
     def __aiter__(self) -> Self:
         return self
@@ -361,9 +445,14 @@ class BodyPartReader:
             return b""
         data = bytearray()
         while not self._at_eof:
-            data.extend(await self.read_chunk(self.chunk_size))
+            chunk = await self.read_chunk(self.chunk_size)
+            data.extend(chunk)
             if len(data) > self._client_max_size:
                 raise self._max_size_error_cls(self._client_max_size)
+            if not decode:
+                # Undecoded reads deliver the bytes as-is, so they count
+                # towards the decoded budgets as well.
+                self._account_decoded(len(chunk))
         # https://github.com/python/mypy/issues/17537
         if decode:  # type: ignore[unreachable]
             decoded_data = bytearray()
@@ -392,6 +481,8 @@ class BodyPartReader:
             fresh = await self._read_chunk_from_stream(want)
         chunk = carry + fresh
         self._read_bytes += len(fresh)
+        if fresh:
+            self._account_raw(len(fresh))
 
         # base64 decodes in quartets and every chunk is decoded on its own, so
         # a chunk should not end mid-quartet.
@@ -525,6 +616,29 @@ class BodyPartReader:
         while not self._at_eof:
             await self.read_chunk(self.chunk_size)
 
+    def close(self) -> None:
+        """Close the part without consuming the rest of its data.
+
+        Marks the part as exhausted so that read()/release() become no-ops.
+        Because the stream is left positioned somewhere inside the part, the
+        parent MultipartReader abandons the remainder of the message on the
+        next next() call; the underlying connection cannot be reused and
+        must be closed by the caller (a server does this automatically when
+        the request payload was not fully consumed).
+        """
+        self._at_eof = True
+        self._closed = True
+
+    def _account_raw(self, size: int) -> None:
+        if self._budget is not None:
+            self._budget.add_raw(size, self._read_bytes)
+
+    def _account_decoded(self, size: int) -> None:
+        if self._budget is None or not size:
+            return
+        self._decoded_bytes += size
+        self._budget.add_decoded(size, self._decoded_bytes)
+
     async def text(self, *, encoding: str | None = None) -> str:
         """Like read(), but assumes that body part contains text data."""
         data = await self.read(decode=True)
@@ -587,7 +701,8 @@ class BodyPartReader:
         """
         data = self._apply_content_transfer_decoding(data)
         if self._needs_content_decoding():
-            return self._decode_content(data)
+            data = self._decode_content(data)
+        self._account_decoded(len(data))
         return data
 
     async def decode_iter(self, data: bytes) -> AsyncIterator[bytes]:
@@ -602,8 +717,10 @@ class BodyPartReader:
         data = self._apply_content_transfer_decoding(data)
         if self._needs_content_decoding():
             async for d in self._decode_content_async(data):
+                self._account_decoded(len(d))
                 yield d
         else:
+            self._account_decoded(len(data))
             yield data
 
     def _decode_content(self, data: bytes) -> bytes:
@@ -731,6 +848,14 @@ class MultipartReader:
         max_field_size: int = 8190,
         max_headers: int = 128,
         max_size_error_cls: type[Exception] = ValueError,
+        max_depth: int | None = None,
+        max_parts: int | None = None,
+        max_part_raw_size: int | None = None,
+        max_part_size: int | None = None,
+        max_total_raw_size: int | None = None,
+        max_total_size: int | None = None,
+        _budget: _MultipartBudget | None = None,
+        _depth: int = 0,
     ) -> None:
         self._mimetype = parse_mimetype(headers[CONTENT_TYPE])
         assert self._mimetype.type == "multipart", "multipart/* content type expected"
@@ -748,7 +873,21 @@ class MultipartReader:
         self._max_field_size = max_field_size
         self._max_headers = max_headers
         self._max_size_error_cls = max_size_error_cls
+        if _budget is None:
+            _budget = _MultipartBudget(
+                max_depth=max_depth,
+                max_parts=max_parts,
+                max_part_raw_size=max_part_raw_size,
+                max_part_size=max_part_size,
+                max_total_raw_size=max_total_raw_size,
+                max_total_size=max_total_size,
+                error_cls=max_size_error_cls,
+            )
+        self._budget = _budget
+        self._depth = _depth
+        self._budget.check_depth(self._depth)
         self._at_eof = False
+        self._closed = False
         self._at_bof = True
         self._unread: list[bytes] = []
 
@@ -789,6 +928,9 @@ class MultipartReader:
         if self._at_eof:
             return None
         await self._maybe_release_last_part()
+        if self._at_eof:
+            # The last part was closed early, abandoning the message.
+            return None
         if self._at_bof:
             await self._read_until_first_boundary()
             self._at_bof = False
@@ -825,11 +967,25 @@ class MultipartReader:
                 break
             await item.release()
 
+    def close(self) -> None:
+        """Close the reader, abandoning any unread parts.
+
+        Marks the reader as finished without draining the remaining body,
+        so next()/release() become no-ops.  The underlying stream is left
+        as-is; the caller (or, on the server side, the connection
+        lifecycle) is responsible for closing the connection, which cannot
+        be reused.  If this reader is itself a nested part, the parent
+        reader abandons the rest of the message on its next next() call.
+        """
+        self._at_eof = True
+        self._closed = True
+
     async def fetch_next_part(
         self,
     ) -> Union["MultipartReader", BodyPartReader]:
         """Returns the next body part reader."""
         headers = await self._read_headers()
+        self._budget.enter_part()
         return self._get_part_reader(headers)
 
     def _get_part_reader(
@@ -854,6 +1010,8 @@ class MultipartReader:
                     max_field_size=self._max_field_size,
                     max_headers=self._max_headers,
                     max_size_error_cls=self._max_size_error_cls,
+                    _budget=self._budget,
+                    _depth=self._depth + 1,
                 )
             return self.multipart_reader_cls(
                 headers,
@@ -862,6 +1020,8 @@ class MultipartReader:
                 max_field_size=self._max_field_size,
                 max_headers=self._max_headers,
                 max_size_error_cls=self._max_size_error_cls,
+                _budget=self._budget,
+                _depth=self._depth + 1,
             )
         else:
             return self.part_reader_cls(
@@ -872,6 +1032,7 @@ class MultipartReader:
                 default_charset=self._default_charset,
                 client_max_size=self._client_max_size,
                 max_size_error_cls=self._max_size_error_cls,
+                budget=self._budget,
             )
 
     def _get_boundary(self) -> str:
@@ -938,7 +1099,13 @@ class MultipartReader:
     async def _maybe_release_last_part(self) -> None:
         """Ensures that the last read body part is read completely."""
         if self._last_part is not None:
-            if not self._last_part.at_eof():
+            if self._last_part._closed:
+                # The last part was closed before being fully consumed, so
+                # the stream position is unknown: abandon the rest of the
+                # message and let the caller close the connection.
+                self._at_eof = True
+                self._closed = True
+            elif not self._last_part.at_eof():
                 await self._last_part.release()
             self._unread.extend(self._last_part._unread)
             self._last_part = None

@@ -69,6 +69,18 @@ Multipart reference
 
       :rtype: None
 
+   .. method:: close()
+
+      Closes the part without consuming the rest of its data.
+
+      Marks the part as exhausted so that :meth:`read` and :meth:`release`
+      become no-ops.  Because the underlying stream is left positioned
+      somewhere inside the part, the parent :class:`MultipartReader`
+      abandons the remainder of the message on its next :meth:`next()
+      <MultipartReader.next>` call, and the connection cannot be reused.
+
+      .. versionadded:: 4.0
+
    .. method:: text(*, encoding=None)
       :async:
 
@@ -173,6 +185,34 @@ Multipart reference
    :canonical: aiohttp.multipart.MultipartReader
 
    Multipart body reader.
+
+   The reader accepts optional limits that are shared with every nested
+   multipart reader and body part reader created from it.  All of them
+   default to ``None`` (no limit).  A violated limit is raised with the
+   ``max_size_error_cls`` exception class (``ValueError`` by default,
+   :exc:`~aiohttp.web_exceptions.HTTPRequestEntityTooLarge` when
+   constructed via :meth:`aiohttp.web_request.BaseRequest.multipart`),
+   which keeps limit errors distinguishable from malformed-body
+   ``ValueError``\ s and from connection errors raised by the stream:
+
+   :param int | None max_depth: Maximum nesting depth of ``multipart/*``
+      parts.  The top-level reader is depth 0, so ``max_depth=0`` rejects
+      any nested multipart.
+   :param int | None max_parts: Maximum total number of parts emitted
+      across the whole (possibly nested) message.
+   :param int | None max_part_raw_size: Maximum bytes read from the
+      stream for a single part, before any decoding.
+   :param int | None max_part_size: Maximum decoded bytes a single part
+      may yield through :meth:`BodyPartReader.read` (also with
+      ``decode=True``), :meth:`BodyPartReader.decode`,
+      :meth:`BodyPartReader.decode_iter`, :meth:`BodyPartReader.text`,
+      :meth:`BodyPartReader.json` and :meth:`BodyPartReader.form`.
+   :param int | None max_total_raw_size: Maximum raw bytes accumulated
+      over all parts of the message, including the parts drained by
+      :meth:`release` or by :meth:`next` when a previous part was not
+      fully consumed.
+   :param int | None max_total_size: Maximum decoded bytes accumulated
+      over all parts of the message.
 
    .. classmethod:: from_response(cls, response)
 

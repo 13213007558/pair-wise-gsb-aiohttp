@@ -7,6 +7,7 @@ import pathlib
 import sys
 from collections.abc import AsyncIterator
 from types import TracebackType
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -1451,6 +1452,427 @@ def test_writer_content_transfer_encoding_unknown(
     with pytest.raises(RuntimeError):
         writer.append("Time to Relax!", {CONTENT_TRANSFER_ENCODING: "unknown"})
 
+
+class StreamWithTinyReads(Stream):
+    """Stream that never returns more than 3 bytes per read call."""
+
+    async def read(self, size: int | None = None) -> bytes:
+        if size is not None:
+            size = min(size, 3)
+        return await super().read(size)
+
+
+def _limits_reader(
+    body: bytes,
+    **kwargs: Any,
+) -> tuple[MultipartReader, Stream]:
+    stream = Stream(body)
+    reader = MultipartReader(
+        {CONTENT_TYPE: 'multipart/related;boundary=":"'}, stream, **kwargs
+    )
+    return reader, stream
+
+
+class TestMultipartLimits:
+    """Acceptance tests for the configurable multipart reader budgets."""
+
+    NESTED_BODY = (
+        b"--:\r\n"
+        b"Content-Type: multipart/mixed; boundary=m1\r\n"
+        b"\r\n"
+        b"--m1\r\n"
+        b"Content-Type: multipart/mixed; boundary=m2\r\n"
+        b"\r\n"
+        b"--m2\r\n"
+        b"\r\n"
+        b"deep\r\n"
+        b"--m2--\r\n"
+        b"--m1--\r\n"
+        b"--:--\r\n"
+    )
+
+    async def test_depth_within_limit(self) -> None:
+        reader, _ = _limits_reader(self.NESTED_BODY, max_depth=2)
+        level1 = await reader.next()
+        assert isinstance(level1, MultipartReader)
+        level2 = await level1.next()
+        assert isinstance(level2, MultipartReader)
+        part = await level2.next()
+        assert isinstance(part, BodyPartReader)
+        assert await part.read() == b"deep"
+
+    async def test_depth_exceeded(self) -> None:
+        reader, _ = _limits_reader(self.NESTED_BODY, max_depth=1)
+        level1 = await reader.next()
+        assert isinstance(level1, MultipartReader)
+        with pytest.raises(ValueError):
+            await level1.next()
+
+    async def test_depth_zero_forbids_nesting(self) -> None:
+        reader, _ = _limits_reader(self.NESTED_BODY, max_depth=0)
+        with pytest.raises(ValueError):
+            await reader.next()
+
+    async def test_max_parts_within_limit(self) -> None:
+        reader, _ = _limits_reader(
+            b"--:\r\n\r\none\r\n--:\r\n\r\ntwo\r\n--:\r\n\r\nthree\r\n--:--\r\n",
+            max_parts=3,
+        )
+        seen = []
+        async for part in reader:
+            seen.append(await part.read())
+        assert seen == [b"one", b"two", b"three"]
+
+    async def test_max_parts_exceeded(self) -> None:
+        reader, _ = _limits_reader(
+            b"--:\r\n\r\none\r\n--:\r\n\r\ntwo\r\n--:\r\n\r\nthree\r\n--:--\r\n",
+            max_parts=2,
+        )
+        await reader.next()
+        await reader.next()
+        with pytest.raises(ValueError):
+            await reader.next()
+
+    async def test_max_parts_counts_nested_parts(self) -> None:
+        body = (
+            b"--:\r\n"
+            b"Content-Type: multipart/mixed; boundary=m1\r\n"
+            b"\r\n"
+            b"--m1\r\n\r\none\r\n"
+            b"--m1\r\n\r\ntwo\r\n"
+            b"--m1--\r\n"
+            b"--:--\r\n"
+        )
+        reader, _ = _limits_reader(body, max_parts=2)
+        nested = await reader.next()
+        assert isinstance(nested, MultipartReader)
+        await nested.next()
+        with pytest.raises(ValueError):
+            await nested.next()
+
+    async def test_max_part_raw_size_boundary(self) -> None:
+        body = b"--:\r\n\r\nhello\r\n--:--\r\n"
+        reader, _ = _limits_reader(body, max_part_raw_size=5)
+        part = await reader.next()
+        assert isinstance(part, BodyPartReader)
+        assert await part.read() == b"hello"
+
+    async def test_max_part_raw_size_exceeded(self) -> None:
+        body = b"--:\r\n\r\nhello\r\n--:--\r\n"
+        reader, _ = _limits_reader(body, max_part_raw_size=4)
+        part = await reader.next()
+        assert isinstance(part, BodyPartReader)
+        with pytest.raises(ValueError):
+            await part.read()
+
+    async def test_max_total_raw_size_spans_parts(self) -> None:
+        body = b"--:\r\n\r\nhello\r\n--:\r\n\r\nworld\r\n--:--\r\n"
+        reader, _ = _limits_reader(body, max_total_raw_size=10)
+        async for part in reader:
+            await part.read()
+        reader, _ = _limits_reader(body, max_total_raw_size=9)
+        await reader.next()
+        part = await reader.next()
+        assert isinstance(part, BodyPartReader)
+        with pytest.raises(ValueError):
+            await part.read()
+
+    async def test_max_part_size_base64_boundary(self) -> None:
+        # 100 decoded bytes are 136 base64 bytes on the wire.
+        data = base64.b64encode(b"x" * 100)
+        body = (
+            b"--:\r\nContent-Transfer-Encoding: base64\r\n\r\n"
+            + data
+            + b"\r\n--:--\r\n"
+        )
+        reader, _ = _limits_reader(body, max_part_size=100)
+        part = await reader.next()
+        assert isinstance(part, BodyPartReader)
+        assert await part.read(decode=True) == b"x" * 100
+
+        reader, _ = _limits_reader(body, max_part_size=99)
+        part = await reader.next()
+        assert isinstance(part, BodyPartReader)
+        with pytest.raises(ValueError):
+            await part.read(decode=True)
+
+    async def test_raw_and_decoded_budgets_are_distinct(self) -> None:
+        data = base64.b64encode(b"x" * 100)
+        body = (
+            b"--:\r\nContent-Transfer-Encoding: base64\r\n\r\n"
+            + data
+            + b"\r\n--:--\r\n"
+        )
+        # The raw budget trips on the 136 wire bytes...
+        reader, _ = _limits_reader(body, max_part_raw_size=135, max_part_size=100)
+        part = await reader.next()
+        assert isinstance(part, BodyPartReader)
+        with pytest.raises(ValueError):
+            await part.read(decode=True)
+        # ...while the decoded budget trips on the 100 decoded bytes.
+        reader, _ = _limits_reader(body, max_part_raw_size=136, max_part_size=99)
+        part = await reader.next()
+        assert isinstance(part, BodyPartReader)
+        with pytest.raises(ValueError):
+            await part.read(decode=True)
+
+    async def test_max_part_size_quoted_printable(self) -> None:
+        data = b"=41" * 100
+        body = (
+            b"--:\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n"
+            + data
+            + b"\r\n--:--\r\n"
+        )
+        reader, _ = _limits_reader(body, max_part_size=100)
+        part = await reader.next()
+        assert isinstance(part, BodyPartReader)
+        assert await part.read(decode=True) == b"A" * 100
+
+        reader, _ = _limits_reader(body, max_part_size=99)
+        part = await reader.next()
+        assert isinstance(part, BodyPartReader)
+        with pytest.raises(ValueError):
+            await part.read(decode=True)
+
+    async def test_total_decoded_budget_stops_gzip_bomb(self) -> None:
+        payload = gzip.compress(b"A" * 100_000)
+        assert len(payload) < 1000
+        body = (
+            b"--:\r\nContent-Encoding: gzip\r\n\r\n" + payload + b"\r\n--:--\r\n"
+        )
+        reader, _ = _limits_reader(body, max_total_size=1000)
+        part = await reader.next()
+        assert isinstance(part, BodyPartReader)
+        with pytest.raises(ValueError):
+            await part.read(decode=True)
+
+        reader, _ = _limits_reader(body, max_total_size=100_000)
+        part = await reader.next()
+        assert isinstance(part, BodyPartReader)
+        assert await part.read(decode=True) == b"A" * 100_000
+
+    async def test_plain_read_counts_towards_decoded_budget(self) -> None:
+        body = b"--:\r\n\r\nhello\r\n--:--\r\n"
+        reader, _ = _limits_reader(body, max_part_size=5)
+        part = await reader.next()
+        assert isinstance(part, BodyPartReader)
+        assert await part.read() == b"hello"
+
+        reader, _ = _limits_reader(body, max_part_size=4)
+        part = await reader.next()
+        assert isinstance(part, BodyPartReader)
+        with pytest.raises(ValueError):
+            await part.read()
+
+    async def test_text_and_json_share_decoded_budget(self) -> None:
+        reader, _ = _limits_reader(
+            b"--:\r\n\r\nhello\r\n--:--\r\n", max_part_size=4
+        )
+        part = await reader.next()
+        assert isinstance(part, BodyPartReader)
+        with pytest.raises(ValueError):
+            await part.text()
+
+        reader, _ = _limits_reader(
+            b"--:\r\n\r\n{\"a\": 1}\r\n--:--\r\n", max_part_size=8
+        )
+        part = await reader.next()
+        assert isinstance(part, BodyPartReader)
+        assert await part.json() == {"a": 1}
+
+        reader, _ = _limits_reader(
+            b"--:\r\n\r\n{\"a\": 1}\r\n--:--\r\n", max_part_size=7
+        )
+        part = await reader.next()
+        assert isinstance(part, BodyPartReader)
+        with pytest.raises(ValueError):
+            await part.json()
+
+    async def test_release_counts_towards_raw_budget(self) -> None:
+        body = b"--:\r\n\r\n" + b"x" * 100 + b"\r\n--:\r\n\r\nok\r\n--:--\r\n"
+        reader, _ = _limits_reader(body, max_total_raw_size=50)
+        with pytest.raises(ValueError):
+            await reader.release()
+
+    async def test_next_drain_does_not_bypass_budget(self) -> None:
+        body = b"--:\r\n\r\n" + b"x" * 100 + b"\r\n--:\r\n\r\nok\r\n--:--\r\n"
+        reader, _ = _limits_reader(body, max_total_raw_size=50)
+        part = await reader.next()
+        assert isinstance(part, BodyPartReader)
+        # The unread remainder of the first part is drained by next() and
+        # the drain is charged against the raw budget.
+        with pytest.raises(ValueError):
+            await reader.next()
+
+    async def test_boundary_split_across_read_chunks(self) -> None:
+        body = (
+            b"--:\r\n"
+            b"Content-Type: multipart/mixed; boundary=m1\r\n"
+            b"\r\n"
+            b"--m1\r\n\r\nhello\r\n"
+            b"--m1--\r\n"
+            b"--:--\r\n"
+        )
+        stream = StreamWithTinyReads(body)
+        reader = MultipartReader(
+            {CONTENT_TYPE: 'multipart/related;boundary=":"'},
+            stream,
+            max_total_raw_size=5,
+        )
+        nested = await reader.next()
+        assert isinstance(nested, MultipartReader)
+        part = await nested.next()
+        assert isinstance(part, BodyPartReader)
+        assert await part.read() == b"hello"
+        assert await nested.next() is None
+        assert await reader.next() is None
+
+    async def test_nested_parts_with_same_name_and_filename(self) -> None:
+        body = (
+            b"--:\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="same.txt"\r\n'
+            b"Content-Type: multipart/mixed; boundary=m1\r\n"
+            b"\r\n"
+            b"--m1\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="same.txt"\r\n'
+            b"\r\n"
+            b"inner-data\r\n"
+            b"--m1--\r\n"
+            b"--:--\r\n"
+        )
+        reader, _ = _limits_reader(body, max_depth=1)
+        nested = await reader.next()
+        assert isinstance(nested, MultipartReader)
+        part = await nested.next()
+        assert isinstance(part, BodyPartReader)
+        assert part.name == "file"
+        assert part.filename == "same.txt"
+        assert await part.read() == b"inner-data"
+
+    async def test_quoted_boundary_parameter(self) -> None:
+        stream = Stream(b"--q u o\r\n\r\nhello\r\n--q u o--\r\n")
+        reader = MultipartReader(
+            {CONTENT_TYPE: 'multipart/related; boundary="q u o"'}, stream
+        )
+        part = await reader.next()
+        assert isinstance(part, BodyPartReader)
+        assert await part.read() == b"hello"
+
+    async def test_missing_terminating_boundary_is_malformed(self) -> None:
+        reader, _ = _limits_reader(b"--:\r\n\r\nhello\r\n", max_total_raw_size=1024)
+        part = await reader.next()
+        assert isinstance(part, BodyPartReader)
+        with pytest.raises(ValueError, match="Reading after EOF"):
+            await part.read()
+
+    async def test_invalid_transfer_encoding_then_next_part(self) -> None:
+        body = (
+            b"--:\r\n"
+            b"Content-Transfer-Encoding: x-unknown\r\n"
+            b"\r\n"
+            b"data\r\n"
+            b"--:\r\n"
+            b"\r\n"
+            b"next-part\r\n"
+            b"--:--\r\n"
+        )
+        reader, _ = _limits_reader(body, max_total_raw_size=1024)
+        part = await reader.next()
+        assert isinstance(part, BodyPartReader)
+        with pytest.raises(RuntimeError, match="unknown content transfer encoding"):
+            await part.read(decode=True)
+        # The payload advanced to the next part despite the decode error.
+        part2 = await reader.next()
+        assert isinstance(part2, BodyPartReader)
+        assert await part2.read() == b"next-part"
+
+    async def test_close_abandons_message_traceably(self) -> None:
+        body = b"--:\r\n\r\n" + b"x" * 100 + b"\r\n--:\r\n\r\nsecond\r\n--:--\r\n"
+        reader, stream = _limits_reader(body)
+        part = await reader.next()
+        assert isinstance(part, BodyPartReader)
+        part.close()
+        assert part.at_eof()
+        assert await reader.next() is None
+        assert reader.at_eof()
+        # The unread remainder stays in the stream: the connection cannot be
+        # reused and must be closed by the caller.
+        assert not stream.at_eof()
+
+    async def test_reader_close(self) -> None:
+        reader, stream = _limits_reader(b"--:\r\n\r\nhello\r\n--:--\r\n")
+        reader.close()
+        assert reader.at_eof()
+        assert await reader.next() is None
+        await reader.release()  # no-op, does not read or hang
+        assert not stream.at_eof()
+
+    async def test_nested_close_abandons_parent(self) -> None:
+        reader, stream = _limits_reader(self.NESTED_BODY)
+        nested = await reader.next()
+        assert isinstance(nested, MultipartReader)
+        nested.close()
+        assert await reader.next() is None
+        assert reader.at_eof()
+        assert not stream.at_eof()
+
+    async def test_cancel_read_then_close(self) -> None:
+        stream = StreamReader(
+            mock.Mock(_reading_paused=False),
+            2**16,
+            loop=asyncio.get_running_loop(),
+        )
+        stream.feed_data(b"--:\r\n\r\npartial-data")
+        reader = MultipartReader(
+            {CONTENT_TYPE: 'multipart/related;boundary=":"'}, stream
+        )
+        part = await reader.next()
+        assert isinstance(part, BodyPartReader)
+        task = asyncio.create_task(part.read())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        part.close()
+        assert await reader.next() is None
+        assert reader.at_eof()
+
+    async def test_client_disconnect_propagates(self) -> None:
+        stream = StreamReader(
+            mock.Mock(_reading_paused=False),
+            2**16,
+            loop=asyncio.get_running_loop(),
+        )
+        stream.feed_data(b"--:\r\n\r\npartial")
+        reader = MultipartReader(
+            {CONTENT_TYPE: 'multipart/related;boundary=":"'}, stream
+        )
+        part = await reader.next()
+        assert isinstance(part, BodyPartReader)
+        stream.set_exception(ConnectionResetError("connection reset by peer"))
+        # Disconnection is not masked as a malformed-body or limit error.
+        with pytest.raises(ConnectionResetError):
+            await part.read()
+
+    async def test_limit_errors_use_max_size_error_cls(self) -> None:
+        reader, _ = _limits_reader(
+            b"--:\r\n\r\nhello\r\n--:--\r\n",
+            max_total_raw_size=1,
+            max_size_error_cls=HTTPRequestEntityTooLarge,
+        )
+        part = await reader.next()
+        assert isinstance(part, BodyPartReader)
+        with pytest.raises(HTTPRequestEntityTooLarge):
+            await part.read()
+
+    async def test_depth_limit_uses_max_size_error_cls(self) -> None:
+        reader, _ = _limits_reader(
+            self.NESTED_BODY,
+            max_depth=0,
+            max_size_error_cls=HTTPRequestEntityTooLarge,
+        )
+        with pytest.raises(HTTPRequestEntityTooLarge):
+            await reader.next()
 
 class TestMultipartWriter:
     def test_default_subtype(self, writer: aiohttp.MultipartWriter) -> None:
