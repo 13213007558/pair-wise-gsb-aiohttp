@@ -1,0 +1,26 @@
+Added resource budgets to :class:`~aiohttp.MultipartReader`: ``max_depth``
+(default ``10``) caps nested ``multipart/*`` recursion, ``max_fields`` caps
+the total number of parts across the whole body, and ``max_part_size`` /
+``max_total_size`` cap decoded bytes per part and in total. The raw
+``client_max_size`` check now lives in ``BodyPartReader.read_chunk``, so
+``read()``, ``readline()``, ``release()`` and the ``next()`` drain of an
+unconsumed part all enforce it consistently, and decoded-byte counting is
+shared by ``read(decode=True)``, ``decode()``, ``decode_iter()``, ``text()``,
+``json()`` and ``form()``.
+
+Reader failures are now classified with new public exceptions:
+:class:`~aiohttp.MultipartFormatError` for malformed bodies (bad or missing
+boundaries, invalid per-part ``Content-Length``, malformed or unknown
+content encodings) and :class:`~aiohttp.MultipartLimitExceeded` -- the new
+default ``max_size_error_cls`` -- for exceeded budgets, while client
+disconnects keep propagating as the original stream error. Both subclass
+``ValueError``, so existing ``except ValueError`` handlers keep working, but
+code catching ``RuntimeError`` for unknown content encodings should switch
+to :class:`~aiohttp.MultipartFormatError`. After a read-side failure the
+reader latches the error and re-raises it on further operations instead of
+parsing from an undefined stream position; decoding failures still leave
+the stream positioned at the next part.
+
+``MultipartReader.from_response()`` now accepts keyword arguments (e.g.
+``max_depth``) and passes them through to the reader constructor
+-- by :user:`aio-libs-bot`.

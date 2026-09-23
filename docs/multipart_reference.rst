@@ -35,6 +35,19 @@ Multipart reference
 
    Multipart reader for single body part.
 
+   The reader enforces the byte budgets configured on the parent
+   :class:`MultipartReader` (or passed directly): *client_max_size* caps
+   the raw bytes of a single part, *max_part_size* caps its decoded
+   bytes.  Both raw and decoded counters are shared by :meth:`read`,
+   :meth:`read_chunk`, :meth:`readline`, :meth:`release`, :meth:`text`,
+   :meth:`json`, :meth:`form`, :meth:`decode` and :meth:`decode_iter`,
+   so draining an unconsumed part cannot bypass the budgets.
+
+   Once a read fails (malformed data, budget exceeded, cancellation or
+   a disconnect), the error is latched and every further operation
+   re-raises it: the reader never silently continues from an undefined
+   stream position.
+
    .. method:: read(*, decode=False)
       :async:
 
@@ -174,11 +187,50 @@ Multipart reference
 
    Multipart body reader.
 
-   .. classmethod:: from_response(cls, response)
+   :param headers: *multipart/* response/request headers mapping.
+   :param content: :class:`~aiohttp.StreamReader` with the body.
+   :param int client_max_size: maximum raw (still encoded) bytes of a
+                               single body part, unlimited by default.
+   :param int max_depth: maximum nesting depth of *multipart/* parts;
+                         the outermost body is depth ``1`` and the
+                         default is ``10``.
+   :param int max_fields: maximum total number of parts across the
+                          whole (possibly nested) body, unlimited by
+                          default.
+   :param int max_part_size: maximum decoded bytes of a single body
+                             part, unlimited by default.
+   :param int max_total_size: maximum decoded bytes summed over all
+                              parts of the whole body, unlimited by
+                              default.
+   :param max_size_error_cls: exception class raised when any of the
+                              budgets above is exceeded;
+                              :class:`MultipartLimitExceeded` by default
+                              and
+                              :exc:`~aiohttp.web_exceptions.HTTPRequestEntityTooLarge`
+                              on the server side.
+
+   Exceeding a budget raises *max_size_error_cls*; malformed bodies
+   raise :class:`MultipartFormatError`; a client disconnect or a
+   cancellation propagates as the original stream error.  After any of
+   these the reader is closed: further calls re-raise the latched
+   error instead of reading from an undefined stream position.
+
+   .. versionchanged:: 4.0
+
+      Added the *max_depth*, *max_fields*, *max_part_size* and
+      *max_total_size* parameters.
+
+   .. classmethod:: from_response(cls, response, **kwargs)
 
       Constructs reader instance from HTTP response.
 
       :param response: :class:`~aiohttp.ClientResponse` instance
+      :param kwargs: passed through to the reader constructor, e.g.
+                      ``max_depth`` or ``max_total_size``.
+
+      .. versionchanged:: 4.0
+
+         Added *kwargs* pass-through.
 
    .. method:: at_eof()
 
@@ -201,6 +253,43 @@ Multipart reference
       :async:
 
       Returns the next body part reader.
+
+
+.. class:: MultipartError
+   :canonical: aiohttp.multipart.MultipartError
+
+   Base class for multipart reader errors.
+
+   .. versionadded:: 4.0
+
+
+.. class:: MultipartFormatError
+   :canonical: aiohttp.multipart.MultipartFormatError
+
+   The multipart body is malformed: bad or missing boundaries, invalid
+   per-part ``Content-Length``, malformed transfer-encoded data or an
+   unknown content encoding.  Subclasses :exc:`ValueError`.
+
+   .. versionadded:: 4.0
+
+
+.. class:: MultipartLimitExceeded
+   :canonical: aiohttp.multipart.MultipartLimitExceeded
+
+   A configured multipart reader budget (depth, field count, raw or
+   decoded size) was exceeded.  Subclasses :exc:`ValueError`.
+
+   .. attribute:: limit
+
+      The configured limit that was exceeded (:class:`int`).
+
+   .. attribute:: kind
+
+      Which budget was exceeded (:class:`str`): ``"size"``,
+      ``"part size"``, ``"total size"``, ``"field count"`` or
+      ``"depth"``.
+
+   .. versionadded:: 4.0
 
 
 .. class:: MultipartWriter(subtype='mixed', boundary=None, close_boundary=True)

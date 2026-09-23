@@ -102,6 +102,57 @@ Once you are done with multipart processing, just break a loop::
     break
 
 
+Reader resource limits
+----------------------
+
+Multipart bodies are fully attacker-controlled on the server side, so
+:class:`MultipartReader` offers optional budgets to bound the
+resources a single body may consume::
+
+    reader = aiohttp.MultipartReader(
+        resp.headers,
+        resp.content,
+        max_depth=3,               # nesting levels of multipart/* parts
+        max_fields=100,            # total parts across the whole body
+        max_part_size=10 * 1024,   # decoded bytes per single part
+        max_total_size=1024**2,    # decoded bytes summed over all parts
+        client_max_size=64 * 1024, # raw (still encoded) bytes per part
+    )
+
+The raw counter (*client_max_size*) and the decoded counters
+(*max_part_size*, *max_total_size*) are shared by every reading
+style: :meth:`~aiohttp.BodyPartReader.read`,
+:meth:`~aiohttp.BodyPartReader.read_chunk`,
+:meth:`~aiohttp.BodyPartReader.text`,
+:meth:`~aiohttp.BodyPartReader.json` and
+:meth:`~aiohttp.BodyPartReader.release` all count the same bytes,
+and draining an unconsumed part on :meth:`~aiohttp.MultipartReader.next`
+cannot bypass the budgets.  Decoded counting covers
+``Content-Transfer-Encoding`` (base64, quoted-printable) and
+``Content-Encoding`` (gzip, deflate) output, so compressed or
+re-encoded bombs are stopped by the decoded budgets even when their
+wire size is small.
+
+Failures come in three distinguishable kinds:
+
+- :class:`aiohttp.MultipartFormatError` for malformed bodies
+  (bad or missing boundaries, invalid per-part ``Content-Length``,
+  malformed base64, unknown encodings);
+- :class:`aiohttp.MultipartLimitExceeded` (or the class passed as
+  *max_size_error_cls*, e.g.
+  :exc:`~aiohttp.web_exceptions.HTTPRequestEntityTooLarge` on the
+  server) when a budget is exceeded;
+- the original stream error (e.g. :exc:`ConnectionResetError` or
+  :exc:`asyncio.CancelledError`) when the peer disconnects or the
+  read is cancelled.
+
+After any of these the affected reader is closed: it latches the
+error and re-raises it on every further operation instead of reading
+from an undefined stream position.  If decoding failed *after* the
+raw part was consumed (for example on malformed base64), the reader
+still advances to the next part normally.
+
+
 Sending Multipart Requests
 --------------------------
 

@@ -393,7 +393,7 @@ class TestPartReader:
         h = HeadersDictProxy(CIMultiDict({CONTENT_ENCODING: "snappy"}))
         with Stream(b"\x0e4Time to Relax!\r\n--:--") as stream:
             obj = aiohttp.BodyPartReader(BOUNDARY, h, stream)
-            with pytest.raises(RuntimeError):
+            with pytest.raises(aiohttp.MultipartFormatError):
                 await obj.read(decode=True)
 
     async def test_read_decode_compressed_exceeds_max_size(self) -> None:
@@ -580,7 +580,9 @@ class TestPartReader:
         with Stream(data + b"\r\n--:--") as stream:
             obj = aiohttp.BodyPartReader(BOUNDARY, h, stream)
             chunk = await obj.read_chunk(size=len(data))
-            with pytest.raises(RuntimeError, match="unknown content encoding"):
+            with pytest.raises(
+                aiohttp.MultipartFormatError, match="unknown content encoding"
+            ):
                 obj.decode(chunk)
 
     async def test_read_with_content_transfer_encoding_quoted_printable(self) -> None:
@@ -616,7 +618,7 @@ class TestPartReader:
         h = HeadersDictProxy(CIMultiDict({CONTENT_TRANSFER_ENCODING: "unknown"}))
         with Stream(b"\x0e4Time to Relax!\r\n--:--") as stream:
             obj = aiohttp.BodyPartReader(BOUNDARY, h, stream)
-            with pytest.raises(RuntimeError):
+            with pytest.raises(aiohttp.MultipartFormatError):
                 await obj.read(decode=True)
 
     async def test_read_text(self) -> None:
@@ -1210,7 +1212,9 @@ class TestMultipartReader:
                 {CONTENT_TYPE: 'multipart/form-data;boundary=":"'},
                 stream,
             )
-            with pytest.raises(RuntimeError, match="Invalid default charset"):
+            with pytest.raises(
+                aiohttp.MultipartFormatError, match="Invalid default charset"
+            ):
                 await reader.next()
 
 
@@ -2009,3 +2013,478 @@ async def test_multipart_writer_consumed_follows_body_part_reader() -> None:
 
         assert part.consumed is True
         assert writer.consumed is True
+
+
+def _nested_multipart(
+    depth: int, leaf: bytes = b"leaf"
+) -> tuple[dict[str, str], bytes]:
+    """Build a multipart/mixed body nested depth levels deep."""
+    content = leaf
+    ctype = "text/plain"
+    for level in range(depth, 0, -1):
+        boundary = "b%d" % level
+        content = (
+            f"--{boundary}\r\nContent-Type: {ctype}\r\n\r\n".encode()
+            + content
+            + f"\r\n--{boundary}--\r\n".encode()
+        )
+        ctype = f"multipart/mixed; boundary={boundary}"
+    return {CONTENT_TYPE: "multipart/mixed; boundary=b1"}, content
+
+
+async def _read_all_leaves(reader: aiohttp.MultipartReader) -> list[bytes]:
+    out = []
+    while (part := await reader.next()) is not None:
+        if isinstance(part, aiohttp.MultipartReader):
+            out.extend(await _read_all_leaves(part))
+        else:
+            out.append(await part.read())
+    return out
+
+
+class ChunkedStream(Stream):
+    """A stream that serves at most step bytes per read() call."""
+
+    def __init__(self, content: bytes, step: int) -> None:
+        super().__init__(content)
+        self.step = step
+        self.read_sizes: list[int] = []
+
+    async def read(self, size: int | None = None) -> bytes:
+        self.read_sizes.append(size)
+        if size is None:
+            return self.content.read(self.step)
+        return self.content.read(min(size, self.step))
+
+
+class TestMultipartLimits:
+    @pytest.mark.parametrize("depth", (1, 2, 3, 10))
+    async def test_max_depth_allows_nesting_within_limit(self, depth: int) -> None:
+        headers, body = _nested_multipart(depth)
+        with Stream(body) as stream:
+            reader = aiohttp.MultipartReader(headers, stream, max_depth=depth)
+            assert await _read_all_leaves(reader) == [b"leaf"]
+
+    @pytest.mark.parametrize("depth", (2, 3, 11))
+    async def test_max_depth_exceeded(self, depth: int) -> None:
+        headers, body = _nested_multipart(depth)
+        with Stream(body) as stream:
+            reader = aiohttp.MultipartReader(headers, stream, max_depth=depth - 1)
+            with pytest.raises(aiohttp.MultipartLimitExceeded) as exc_info:
+                await _read_all_leaves(reader)
+            assert exc_info.value.kind == "depth"
+            assert exc_info.value.limit == depth - 1
+
+    async def test_default_max_depth_is_ten(self) -> None:
+        headers, body = _nested_multipart(11)
+        with Stream(body) as stream:
+            reader = aiohttp.MultipartReader(headers, stream)
+            with pytest.raises(aiohttp.MultipartLimitExceeded):
+                await _read_all_leaves(reader)
+
+    async def test_max_fields_counts_every_part(self) -> None:
+        headers = {CONTENT_TYPE: 'multipart/mixed; boundary=":"'}
+        body = b"--:\r\n\r\none\r\n--:\r\n\r\ntwo\r\n--:--"
+        with Stream(body) as stream:
+            reader = aiohttp.MultipartReader(headers, stream, max_fields=2)
+            assert await _read_all_leaves(reader) == [b"one", b"two"]
+
+    async def test_max_fields_exceeded(self) -> None:
+        headers = {CONTENT_TYPE: 'multipart/mixed; boundary=":"'}
+        body = b"--:\r\n\r\none\r\n--:\r\n\r\ntwo\r\n--:\r\n\r\nthree\r\n--:--"
+        with Stream(body) as stream:
+            reader = aiohttp.MultipartReader(headers, stream, max_fields=2)
+            with pytest.raises(aiohttp.MultipartLimitExceeded) as exc_info:
+                await _read_all_leaves(reader)
+            assert exc_info.value.kind == "field count"
+            assert exc_info.value.limit == 2
+
+    async def test_max_fields_counts_nested_parts_tree_wide(self) -> None:
+        headers = {CONTENT_TYPE: "multipart/mixed; boundary=b1"}
+        body = (
+            b"--b1\r\nContent-Type: multipart/mixed; boundary=b2\r\n\r\n"
+            b"--b2\r\n\r\ninner1\r\n--b2\r\n\r\ninner2\r\n--b2--\r\n"
+            b"\r\n--b1\r\n\r\nouter\r\n--b1--\r\n"
+        )
+        with Stream(body) as stream:
+            reader = aiohttp.MultipartReader(headers, stream, max_fields=4)
+            assert await _read_all_leaves(reader) == [b"inner1", b"inner2", b"outer"]
+        with Stream(body) as stream:
+            reader = aiohttp.MultipartReader(headers, stream, max_fields=3)
+            with pytest.raises(aiohttp.MultipartLimitExceeded) as exc_info:
+                await _read_all_leaves(reader)
+            assert exc_info.value.kind == "field count"
+
+    async def test_max_part_size_counts_decoded_bytes(self) -> None:
+        # base64 is 4/3 larger on the wire; the budget applies after decoding.
+        raw = base64.b64encode(b"x" * 100)
+        headers = {CONTENT_TYPE: 'multipart/mixed; boundary=":"'}
+        body = b"--:\r\nContent-Transfer-Encoding: base64\r\n\r\n" + raw + b"\r\n--:--"
+        with Stream(body) as stream:
+            reader = aiohttp.MultipartReader(headers, stream, max_part_size=100)
+            part = await reader.next()
+            assert isinstance(part, BodyPartReader)
+            assert await part.read(decode=True) == b"x" * 100
+        with Stream(body) as stream:
+            reader = aiohttp.MultipartReader(headers, stream, max_part_size=99)
+            part = await reader.next()
+            assert isinstance(part, BodyPartReader)
+            with pytest.raises(aiohttp.MultipartLimitExceeded) as exc_info:
+                await part.read(decode=True)
+            assert exc_info.value.kind == "part size"
+
+    async def test_max_part_size_stops_compression_bomb(self) -> None:
+        # A small body on the wire expands far beyond the decoded budget.
+        compressed = gzip.compress(b"A" * 100_000)
+        headers = {CONTENT_TYPE: 'multipart/mixed; boundary=":"'}
+        body = b"--:\r\nContent-Encoding: gzip\r\n\r\n" + compressed + b"\r\n--:--"
+        with Stream(body) as stream:
+            reader = aiohttp.MultipartReader(headers, stream, max_part_size=1024)
+            part = await reader.next()
+            assert isinstance(part, BodyPartReader)
+            with pytest.raises(aiohttp.MultipartLimitExceeded) as exc_info:
+                await part.read(decode=True)
+            assert exc_info.value.kind == "part size"
+
+    async def test_decode_iter_counts_toward_part_budget(self) -> None:
+        # The chunked decode path used by Request.post() and payload writing
+        # shares the same decoded-byte accounting as read(decode=True).
+        compressed = gzip.compress(b"A" * 10_000)
+        h = HeadersDictProxy(CIMultiDict({CONTENT_ENCODING: "gzip"}))
+        with Stream(compressed + b"\r\n--:--") as stream:
+            part = aiohttp.BodyPartReader(BOUNDARY, h, stream, max_part_size=1024)
+            with pytest.raises(aiohttp.MultipartLimitExceeded):
+                while chunk := await part.read_chunk():
+                    async for _ in part.decode_iter(chunk):
+                        pass
+
+    async def test_max_total_size_spans_parts(self) -> None:
+        headers = {CONTENT_TYPE: 'multipart/mixed; boundary=":"'}
+        body = (
+            b"--:\r\nContent-Transfer-Encoding: base64\r\n\r\n"
+            + base64.b64encode(b"a" * 60)
+            + b"\r\n--:\r\nContent-Transfer-Encoding: base64\r\n\r\n"
+            + base64.b64encode(b"b" * 60)
+            + b"\r\n--:--"
+        )
+        with Stream(body) as stream:
+            reader = aiohttp.MultipartReader(headers, stream, max_total_size=100)
+            part1 = await reader.next()
+            assert isinstance(part1, BodyPartReader)
+            assert await part1.read(decode=True) == b"a" * 60
+            part2 = await reader.next()
+            assert isinstance(part2, BodyPartReader)
+            with pytest.raises(aiohttp.MultipartLimitExceeded) as exc_info:
+                await part2.read(decode=True)
+            assert exc_info.value.kind == "total size"
+            assert exc_info.value.limit == 100
+
+    async def test_max_total_size_counts_nested_parts(self) -> None:
+        headers = {CONTENT_TYPE: "multipart/mixed; boundary=b1"}
+        body = (
+            b"--b1\r\nContent-Type: multipart/mixed; boundary=b2\r\n\r\n"
+            b"--b2\r\nContent-Transfer-Encoding: base64\r\n\r\n"
+            + base64.b64encode(b"n" * 40)
+            + b"\r\n--b2--\r\n"
+            b"\r\n--b1\r\nContent-Transfer-Encoding: base64\r\n\r\n"
+            + base64.b64encode(b"o" * 40)
+            + b"\r\n--b1--\r\n"
+        )
+        with Stream(body) as stream:
+            reader = aiohttp.MultipartReader(headers, stream, max_total_size=70)
+            nested = await reader.next()
+            assert isinstance(nested, aiohttp.MultipartReader)
+            inner = await nested.next()
+            assert isinstance(inner, BodyPartReader)
+            assert await inner.read(decode=True) == b"n" * 40
+            outer = await reader.next()
+            assert isinstance(outer, BodyPartReader)
+            with pytest.raises(aiohttp.MultipartLimitExceeded):
+                await outer.read(decode=True)
+
+    async def test_raw_budget_applies_at_every_nesting_level(self) -> None:
+        headers, body = _nested_multipart(3, leaf=b"x" * 100)
+        with Stream(body) as stream:
+            reader = aiohttp.MultipartReader(headers, stream, client_max_size=50)
+            with pytest.raises(aiohttp.MultipartLimitExceeded) as exc_info:
+                await _read_all_leaves(reader)
+            assert exc_info.value.kind == "size"
+
+    async def test_next_drain_cannot_bypass_raw_budget(self) -> None:
+        # An unconsumed part is drained by next(); the drain counts toward
+        # the raw budget instead of bypassing it.
+        headers = {CONTENT_TYPE: 'multipart/mixed; boundary=":"'}
+        body = b"--:\r\n\r\n" + b"x" * 100 + b"\r\n--:\r\n\r\nsecond\r\n--:--"
+        with Stream(body) as stream:
+            reader = aiohttp.MultipartReader(headers, stream, client_max_size=10)
+            part = await reader.next()
+            assert isinstance(part, BodyPartReader)
+            assert await part.read_chunk(10) == b"x" * 10
+            with pytest.raises(aiohttp.MultipartLimitExceeded) as exc_info:
+                await reader.next()
+            assert exc_info.value.kind == "size"
+
+    async def test_release_enforces_raw_budget(self) -> None:
+        h = HeadersDictProxy(CIMultiDict())
+        with Stream(b"x" * 100 + b"\r\n--:--") as stream:
+            part = aiohttp.BodyPartReader(BOUNDARY, h, stream, client_max_size=10)
+            with pytest.raises(aiohttp.MultipartLimitExceeded):
+                await part.release()
+
+    async def test_readline_counts_toward_raw_budget(self) -> None:
+        h = HeadersDictProxy(CIMultiDict())
+        with Stream(b"hello\r\nworld\r\n--:--") as stream:
+            part = aiohttp.BodyPartReader(BOUNDARY, h, stream, client_max_size=8)
+            assert await part.readline() == b"hello\r\n"
+            with pytest.raises(aiohttp.MultipartLimitExceeded):
+                await part.readline()
+
+    async def test_text_and_json_share_decoded_budget(self) -> None:
+        headers = {CONTENT_TYPE: 'multipart/mixed; boundary=":"'}
+        body = (
+            b"--:\r\nContent-Type: text/plain\r\n\r\n"
+            + b"t" * 50
+            + b"\r\n--:\r\nContent-Type: application/json\r\n\r\n"
+            + b'{"k": "'
+            + b"j" * 50
+            + b'"}'
+            + b"\r\n--:--"
+        )
+        with Stream(body) as stream:
+            reader = aiohttp.MultipartReader(headers, stream, max_total_size=60)
+            part = await reader.next()
+            assert isinstance(part, BodyPartReader)
+            assert await part.text() == "t" * 50
+            part = await reader.next()
+            assert isinstance(part, BodyPartReader)
+            with pytest.raises(aiohttp.MultipartLimitExceeded):
+                await part.json()
+
+    async def test_custom_error_cls_receives_all_limit_violations(self) -> None:
+        headers = {CONTENT_TYPE: 'multipart/mixed; boundary=":"'}
+        body = b"--:\r\n\r\n" + b"x" * 100 + b"\r\n--:--"
+        with Stream(body) as stream:
+            reader = aiohttp.MultipartReader(
+                headers,
+                stream,
+                client_max_size=10,
+                max_size_error_cls=HTTPRequestEntityTooLarge,
+            )
+            part = await reader.next()
+            assert isinstance(part, BodyPartReader)
+            with pytest.raises(HTTPRequestEntityTooLarge):
+                await part.read()
+        headers2, body2 = _nested_multipart(2)
+        with Stream(body2) as stream:
+            reader = aiohttp.MultipartReader(
+                headers2,
+                stream,
+                max_depth=1,
+                max_size_error_cls=HTTPRequestEntityTooLarge,
+            )
+            with pytest.raises(HTTPRequestEntityTooLarge):
+                await reader.next()
+
+    async def test_from_response_passes_limit_kwargs(self) -> None:
+        headers, body = _nested_multipart(2)
+        h = HeadersDictProxy(
+            CIMultiDict({CONTENT_TYPE: "multipart/mixed; boundary=b1"})
+        )
+        with Stream(body) as stream:
+            resp = Response(h, stream)
+            wrapper = aiohttp.MultipartReader.from_response(resp, max_depth=1)
+            with pytest.raises(aiohttp.MultipartLimitExceeded):
+                await wrapper.next()
+
+
+class TestMultipartEdgeCases:
+    @pytest.mark.parametrize("step", (1, 2, 3, 7))
+    async def test_boundary_split_across_read_chunks(self, step: int) -> None:
+        # The boundary delimiter may straddle several read() chunks; the
+        # reader must still find it and advance to the next part.
+        headers, body = _nested_multipart(2, leaf=b"split-leaf")
+        with ChunkedStream(body, step) as stream:
+            reader = aiohttp.MultipartReader(headers, stream)
+            assert await _read_all_leaves(reader) == [b"split-leaf"]
+
+    async def test_quoted_boundary_parameter(self) -> None:
+        headers = {CONTENT_TYPE: 'multipart/mixed; boundary="quo=ted boundary"'}
+        body = (
+            b"--quo=ted boundary\r\n\r\nfirst\r\n"
+            b"--quo=ted boundary\r\n\r\nsecond\r\n"
+            b"--quo=ted boundary--\r\n"
+        )
+        with Stream(body) as stream:
+            reader = aiohttp.MultipartReader(headers, stream)
+            assert await _read_all_leaves(reader) == [b"first", b"second"]
+
+    async def test_nested_same_name_fields_with_filename_and_cte(self) -> None:
+        # Parts at every level may declare filename and
+        # Content-Transfer-Encoding; same names do not collide.
+        inner_raw = base64.b64encode(b"inner-" * 100)  # 600 bytes decoded
+        outer_raw = b"=C3=A9" * 50  # quoted-printable, 100 bytes decoded
+        headers = {CONTENT_TYPE: "multipart/mixed; boundary=b1"}
+        body = (
+            b"--b1\r\nContent-Type: multipart/mixed; boundary=b2\r\n\r\n"
+            b"--b2\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="inner.txt"\r\n'
+            b"Content-Transfer-Encoding: base64\r\n\r\n" + inner_raw + b"\r\n--b2--\r\n"
+            b"\r\n--b1\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="outer.txt"\r\n'
+            b"Content-Transfer-Encoding: quoted-printable\r\n\r\n"
+            + outer_raw
+            + b"\r\n--b1--\r\n"
+        )
+        with ChunkedStream(body, 5) as stream:
+            reader = aiohttp.MultipartReader(
+                headers, stream, max_part_size=600, max_total_size=700
+            )
+            nested = await reader.next()
+            assert isinstance(nested, aiohttp.MultipartReader)
+            inner = await nested.next()
+            assert isinstance(inner, BodyPartReader)
+            assert inner.name == "file"
+            assert inner.filename == "inner.txt"
+            assert await inner.read(decode=True) == b"inner-" * 100
+            outer = await reader.next()
+            assert isinstance(outer, BodyPartReader)
+            assert outer.name == "file"
+            assert outer.filename == "outer.txt"
+            assert await outer.read(decode=True) == "é".encode() * 50
+
+    async def test_missing_terminating_boundary_is_format_error(self) -> None:
+        headers = {CONTENT_TYPE: 'multipart/mixed; boundary=":"'}
+        body = b"--:\r\n\r\ndata\r\n"  # client closed before the final boundary
+        with Stream(body) as stream:
+            reader = aiohttp.MultipartReader(headers, stream)
+            part = await reader.next()
+            assert isinstance(part, BodyPartReader)
+            with pytest.raises(aiohttp.MultipartFormatError):
+                await part.read()
+            # The failure is latched: further operations re-raise it
+            # instead of hanging or parsing from an undefined position.
+            with pytest.raises(aiohttp.MultipartFormatError):
+                await part.read_chunk()
+            with pytest.raises(aiohttp.MultipartFormatError):
+                await reader.next()
+
+    async def test_format_error_is_latched_on_reader(self) -> None:
+        headers = {CONTENT_TYPE: 'multipart/mixed; boundary=":"'}
+        body = (
+            b"--:\r\nContent-Length: 5\r\n\r\nfirst\r\n"
+            b"--:\r\nContent-Length: 6\r\n\r\nsecond\r\n"
+            b"--;--\r\n"  # wrong closing boundary
+        )
+        with Stream(body) as stream:
+            reader = aiohttp.MultipartReader(headers, stream)
+            part = await reader.next()
+            assert isinstance(part, BodyPartReader)
+            assert await part.read() == b"first"
+            part = await reader.next()
+            assert isinstance(part, BodyPartReader)
+            assert await part.read() == b"second"
+            with pytest.raises(aiohttp.MultipartFormatError):
+                await reader.next()
+            # Latched: the same error is re-raised, not re-parsed.
+            with pytest.raises(aiohttp.MultipartFormatError):
+                await reader.next()
+
+    async def test_unknown_transfer_encoding_leaves_stream_position(self) -> None:
+        # The raw part is consumed before decoding fails, so the reader
+        # can still advance to the next part.
+        headers = {CONTENT_TYPE: 'multipart/mixed; boundary=":"'}
+        body = (
+            b"--:\r\nContent-Transfer-Encoding: x-unknown\r\n\r\npayload"
+            b"\r\n--:\r\n\r\nnext-part\r\n--:--"
+        )
+        with Stream(body) as stream:
+            reader = aiohttp.MultipartReader(headers, stream)
+            part = await reader.next()
+            assert isinstance(part, BodyPartReader)
+            with pytest.raises(aiohttp.MultipartFormatError):
+                await part.read(decode=True)
+            nxt = await reader.next()
+            assert isinstance(nxt, BodyPartReader)
+            assert await nxt.read() == b"next-part"
+
+    async def test_malformed_base64_is_format_error(self) -> None:
+        headers = {CONTENT_TYPE: 'multipart/mixed; boundary=":"'}
+        body = (
+            b"--:\r\nContent-Transfer-Encoding: base64\r\n\r\nA"
+            b"\r\n--:\r\n\r\nnext-part\r\n--:--"
+        )
+        with Stream(body) as stream:
+            reader = aiohttp.MultipartReader(headers, stream)
+            part = await reader.next()
+            assert isinstance(part, BodyPartReader)
+            with pytest.raises(aiohttp.MultipartFormatError):
+                await part.read(decode=True)
+            nxt = await reader.next()
+            assert isinstance(nxt, BodyPartReader)
+            assert await nxt.read() == b"next-part"
+
+    async def test_client_disconnect_propagates_unwrapped(self) -> None:
+        # A disconnect surfaces as the original stream error, distinct
+        # from format errors and limit violations.
+        class ResetStream(Stream):
+            async def read(self, size: int | None = None) -> bytes:
+                raise ConnectionResetError("client went away")
+
+        h = HeadersDictProxy(CIMultiDict())
+        with ResetStream(b"") as stream:
+            part = aiohttp.BodyPartReader(BOUNDARY, h, stream)
+            with pytest.raises(ConnectionResetError):
+                await part.read_chunk()
+            # Latched, but still the original disconnect error type.
+            with pytest.raises(ConnectionResetError):
+                await part.read_chunk()
+
+    async def test_cancellation_closes_reader(self) -> None:
+        class BlockingStream(Stream):
+            def __init__(self) -> None:
+                super().__init__(b"")
+                self.read_started = asyncio.Event()
+
+            async def read(self, size: int | None = None) -> bytes:
+                self.read_started.set()
+                await asyncio.Event().wait()
+                return b""  # pragma: no cover
+
+        stream = BlockingStream()
+        h = HeadersDictProxy(CIMultiDict())
+        part = aiohttp.BodyPartReader(BOUNDARY, h, stream)
+        task = asyncio.create_task(part.read_chunk())
+        await stream.read_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # After a cancellation the stream position is undefined: the
+        # reader is closed traceably instead of hanging or mis-parsing.
+        with pytest.raises(asyncio.CancelledError):
+            await part.read_chunk()
+        with pytest.raises(asyncio.CancelledError):
+            await part.release()
+
+    async def test_release_streams_without_buffering_whole_body(self) -> None:
+        # Draining a large part never loads it into memory: the underlying
+        # stream is only ever asked for bounded chunks.
+        headers = {CONTENT_TYPE: 'multipart/mixed; boundary=":"'}
+        body = b"--:\r\n\r\n" + b"x" * (1024 * 1024) + b"\r\n--:\r\n\r\nnext\r\n--:--"
+        with ChunkedStream(body, 64 * 1024) as stream:
+            reader = aiohttp.MultipartReader(headers, stream)
+            part = await reader.next()
+            assert isinstance(part, BodyPartReader)
+            await part.release()
+            assert max(stream.read_sizes) <= part.chunk_size
+            nxt = await reader.next()
+            assert isinstance(nxt, BodyPartReader)
+            assert await nxt.read() == b"next"
+
+
+def test_multipart_limit_exceeded_attributes() -> None:
+    exc = aiohttp.MultipartLimitExceeded(10, kind="depth")
+    assert isinstance(exc, ValueError)
+    assert isinstance(exc, aiohttp.MultipartError)
+    assert exc.limit == 10
+    assert exc.kind == "depth"
+    assert "depth" in str(exc)

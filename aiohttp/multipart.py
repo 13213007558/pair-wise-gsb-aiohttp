@@ -58,6 +58,9 @@ __all__ = (
     "BodyPartReader",
     "BadContentDispositionHeader",
     "BadContentDispositionParam",
+    "MultipartError",
+    "MultipartFormatError",
+    "MultipartLimitExceeded",
     "parse_content_disposition",
     "content_disposition_filename",
 )
@@ -80,6 +83,72 @@ class BadContentDispositionHeader(RuntimeWarning):
 
 class BadContentDispositionParam(RuntimeWarning):
     pass
+
+
+class MultipartError(Exception):
+    """Base class for multipart reader errors."""
+
+
+class MultipartFormatError(MultipartError, ValueError):
+    """The multipart body is malformed and cannot be parsed.
+
+    Raised for structural problems: bad or missing boundaries, invalid
+    per-part Content-Length, malformed transfer-encoded data and
+    unknown content encodings.  After this error the stream position is
+    undefined, so the reader latches it and refuses further operations.
+    """
+
+
+class MultipartLimitExceeded(MultipartError, ValueError):
+    """A configured multipart reader budget was exceeded.
+
+    This is the default max_size_error_cls for MultipartReader
+    and BodyPartReader; servers usually substitute
+    HTTPRequestEntityTooLarge instead.
+    """
+
+    def __init__(
+        self, limit: int, actual: int | None = None, *, kind: str = "size"
+    ) -> None:
+        self.limit = limit
+        self.actual = actual
+        self.kind = kind
+        super().__init__(f"Multipart {kind} limit of {limit} exceeded")
+
+
+def _limit_error(error_cls: type[Exception], limit: int, kind: str) -> Exception:
+    if error_cls is MultipartLimitExceeded:
+        return MultipartLimitExceeded(limit, kind=kind)
+    return error_cls(limit)
+
+
+class _MultipartBudget:
+    """Tree-wide counters and limits shared by nested multipart readers."""
+
+    __slots__ = ("error_cls", "fields", "max_fields", "max_total_size", "total_size")
+
+    def __init__(
+        self,
+        *,
+        max_fields: int,
+        max_total_size: int,
+        error_cls: type[Exception],
+    ) -> None:
+        self.fields = 0
+        self.total_size = 0
+        self.max_fields = max_fields
+        self.max_total_size = max_total_size
+        self.error_cls = error_cls
+
+    def add_field(self) -> None:
+        self.fields += 1
+        if self.fields > self.max_fields:
+            raise _limit_error(self.error_cls, self.max_fields, "field count")
+
+    def add_decoded(self, size: int) -> None:
+        self.total_size += size
+        if self.total_size > self.max_total_size:
+            raise _limit_error(self.error_cls, self.max_total_size, "total size")
 
 
 def parse_content_disposition(
@@ -308,7 +377,8 @@ class BodyPartReader:
         default_charset: str | None = None,
         max_decompress_size: int = DEFAULT_CHUNK_SIZE,
         client_max_size: int = sys.maxsize,
-        max_size_error_cls: type[Exception] = ValueError,
+        max_part_size: int = sys.maxsize,
+        max_size_error_cls: type[Exception] = MultipartLimitExceeded,
     ) -> None:
         self.headers = headers
         self._boundary = boundary
@@ -323,9 +393,11 @@ class BodyPartReader:
             # Reject sign prefixes, underscores, whitespace and non-ASCII
             # digits that int() would otherwise accept.
             # https://www.rfc-editor.org/rfc/rfc9110#section-8.6
-            raise ValueError(f"invalid Content-Length: {length!r}")
+            raise MultipartFormatError(f"invalid Content-Length: {length!r}")
         self._length = int(length) if length is not None else None
         self._read_bytes = 0
+        self._raw_bytes = 0
+        self._decoded_bytes = 0
         self._b64_carry = b""
         self._unread: deque[bytes] = deque()
         self._prev_chunk: bytes | None = None
@@ -333,7 +405,31 @@ class BodyPartReader:
         self._cache: dict[str, Any] = {}
         self._max_decompress_size = max_decompress_size
         self._client_max_size = client_max_size
+        self._max_part_size = max_part_size
         self._max_size_error_cls = max_size_error_cls
+        self._budget: _MultipartBudget | None = None
+        self._error: BaseException | None = None
+
+    def _raise_if_failed(self) -> None:
+        # Once a read fails the stream position is undefined, so the error
+        # is latched and every further operation re-raises it instead of
+        # silently parsing garbage.
+        if self._error is not None:
+            raise self._error
+
+    def _count_raw(self, size: int) -> None:
+        self._raw_bytes += size
+        if self._raw_bytes > self._client_max_size:
+            raise _limit_error(self._max_size_error_cls, self._client_max_size, "size")
+
+    def _count_decoded(self, size: int) -> None:
+        self._decoded_bytes += size
+        if self._decoded_bytes > self._max_part_size:
+            raise _limit_error(
+                self._max_size_error_cls, self._max_part_size, "part size"
+            )
+        if self._budget is not None:
+            self._budget.add_decoded(size)
 
     def __aiter__(self) -> Self:
         return self
@@ -357,20 +453,21 @@ class BodyPartReader:
                 method from Content-Encoding header. If it missed
                 data remains untouched
         """
+        self._raise_if_failed()
         if self._at_eof:
             return b""
         data = bytearray()
         while not self._at_eof:
             data.extend(await self.read_chunk(self.chunk_size))
-            if len(data) > self._client_max_size:
-                raise self._max_size_error_cls(self._client_max_size)
         # https://github.com/python/mypy/issues/17537
         if decode:  # type: ignore[unreachable]
             decoded_data = bytearray()
             async for d in self.decode_iter(data):
                 decoded_data.extend(d)
                 if len(decoded_data) > self._client_max_size:
-                    raise self._max_size_error_cls(self._client_max_size)
+                    raise _limit_error(
+                        self._max_size_error_cls, self._client_max_size, "size"
+                    )
             return decoded_data
         return data
 
@@ -379,8 +476,16 @@ class BodyPartReader:
 
         size: chunk size
         """
+        self._raise_if_failed()
         if self._at_eof:
             return b""
+        try:
+            return await self._read_chunk(size)
+        except BaseException as exc:
+            self._error = exc
+            raise
+
+    async def _read_chunk(self, size: int) -> bytes:
         carry = self._b64_carry
         want = size - len(carry)
         if carry:
@@ -401,8 +506,11 @@ class BodyPartReader:
 
         if self._read_bytes == self._length:
             self._at_eof = True
+        self._count_raw(len(chunk))
         if self._at_eof and await self._content.readline() != b"\r\n":
-            raise ValueError("Reader did not read all the data or it is malformed")
+            raise MultipartFormatError(
+                "Reader did not read all the data or it is malformed"
+            )
         return chunk
 
     def _align_base64_chunk(self, chunk: bytes, size: int) -> bytes:
@@ -462,7 +570,7 @@ class BodyPartReader:
             chunk += await self._content.read(size)
             self._content_eof += int(self._content.at_eof())
             if self._content_eof > 2:
-                raise ValueError("Reading after EOF")
+                raise MultipartFormatError("Reading after EOF")
             if self._content_eof:
                 break
         if len(chunk) > size:
@@ -491,9 +599,19 @@ class BodyPartReader:
 
     async def readline(self) -> bytes:
         """Reads body part by line by line."""
+        self._raise_if_failed()
         if self._at_eof:
             return b""
+        try:
+            line = await self._readline()
+            if line:
+                self._count_raw(len(line))
+            return line
+        except BaseException as exc:
+            self._error = exc
+            raise
 
+    async def _readline(self) -> bytes:
         if self._unread:
             line = self._unread.popleft()
         else:
@@ -520,6 +638,7 @@ class BodyPartReader:
 
     async def release(self) -> None:
         """Like read(), but reads all the data to the void."""
+        self._raise_if_failed()
         if self._at_eof:
             return
         while not self._at_eof:
@@ -587,7 +706,8 @@ class BodyPartReader:
         """
         data = self._apply_content_transfer_decoding(data)
         if self._needs_content_decoding():
-            return self._decode_content(data)
+            data = self._decode_content(data)
+        self._count_decoded(len(data))
         return data
 
     async def decode_iter(self, data: bytes) -> AsyncIterator[bytes]:
@@ -602,8 +722,10 @@ class BodyPartReader:
         data = self._apply_content_transfer_decoding(data)
         if self._needs_content_decoding():
             async for d in self._decode_content_async(data):
+                self._count_decoded(len(d))
                 yield d
         else:
+            self._count_decoded(len(data))
             yield data
 
     def _decode_content(self, data: bytes) -> bytes:
@@ -616,7 +738,7 @@ class BodyPartReader:
                 suppress_deflate_header=True,
             ).decompress_sync(data, max_length=self._max_decompress_size)
 
-        raise RuntimeError(f"unknown content encoding: {encoding}")
+        raise MultipartFormatError(f"unknown content encoding: {encoding}")
 
     async def _decode_content_async(self, data: bytes) -> AsyncIterator[bytes]:
         encoding = self.headers.get(CONTENT_ENCODING, "").lower()
@@ -631,19 +753,24 @@ class BodyPartReader:
             while d.data_available:
                 yield await d.decompress(b"", max_length=self._max_decompress_size)
         else:
-            raise RuntimeError(f"unknown content encoding: {encoding}")
+            raise MultipartFormatError(f"unknown content encoding: {encoding}")
 
     def _decode_content_transfer(self, data: bytes) -> bytes:
         encoding = self.headers.get(CONTENT_TRANSFER_ENCODING, "").lower()
 
         if encoding == "base64":
-            return base64.b64decode(data)
+            try:
+                return base64.b64decode(data)
+            except binascii.Error as exc:
+                raise MultipartFormatError(
+                    f"malformed base64 encoded part: {exc}"
+                ) from exc
         elif encoding == "quoted-printable":
             return binascii.a2b_qp(data)
         elif encoding in ("binary", "8bit", "7bit"):
             return data
         else:
-            raise RuntimeError(f"unknown content transfer encoding: {encoding}")
+            raise MultipartFormatError(f"unknown content transfer encoding: {encoding}")
 
     def get_charset(self, default: str) -> str:
         """Returns charset parameter from Content-Type header or default."""
@@ -730,27 +857,46 @@ class MultipartReader:
         client_max_size: int = sys.maxsize,
         max_field_size: int = 8190,
         max_headers: int = 128,
-        max_size_error_cls: type[Exception] = ValueError,
+        max_size_error_cls: type[Exception] = MultipartLimitExceeded,
+        max_depth: int = 10,
+        max_fields: int = sys.maxsize,
+        max_part_size: int = sys.maxsize,
+        max_total_size: int = sys.maxsize,
     ) -> None:
         self._mimetype = parse_mimetype(headers[CONTENT_TYPE])
         assert self._mimetype.type == "multipart", "multipart/* content type expected"
         if "boundary" not in self._mimetype.parameters:
-            raise ValueError(
+            raise MultipartFormatError(
                 "boundary missed for Content-Type: %s" % headers[CONTENT_TYPE]
             )
 
         self.headers = headers
         self._boundary = ("--" + self._get_boundary()).encode()
         self._client_max_size = client_max_size
+        self._max_part_size = max_part_size
         self._content = content
         self._default_charset: str | None = None
         self._last_part: MultipartReader | BodyPartReader | None = None
         self._max_field_size = max_field_size
         self._max_headers = max_headers
         self._max_size_error_cls = max_size_error_cls
+        self._max_depth = max_depth
+        self._depth = 1
+        self._budget = _MultipartBudget(
+            max_fields=max_fields,
+            max_total_size=max_total_size,
+            error_cls=max_size_error_cls,
+        )
+        self._error: BaseException | None = None
         self._at_eof = False
         self._at_bof = True
         self._unread: list[bytes] = []
+
+    def _raise_if_failed(self) -> None:
+        # A failed reader cannot safely resume parsing: the error is
+        # latched and re-raised by every further operation.
+        if self._error is not None:
+            raise self._error
 
     def __aiter__(self) -> Self:
         return self
@@ -767,13 +913,16 @@ class MultipartReader:
     def from_response(
         cls,
         response: "ClientResponse",
+        **kwargs: Any,
     ) -> MultipartResponseWrapper:
         """Constructs reader instance from HTTP response.
 
         :param response: :class:`~aiohttp.client.ClientResponse` instance
+        :param kwargs: passed through to the reader constructor, e.g.
+                       max_depth or max_total_size
         """
         obj = cls.response_wrapper_cls(
-            response, cls(response.headers, response.content)
+            response, cls(response.headers, response.content, **kwargs)
         )
         return obj
 
@@ -785,9 +934,17 @@ class MultipartReader:
         self,
     ) -> Union["MultipartReader", BodyPartReader] | None:
         """Emits the next multipart body part."""
+        self._raise_if_failed()
         # So, if we're at BOF, we need to skip till the boundary.
         if self._at_eof:
             return None
+        try:
+            return await self._next()
+        except BaseException as exc:
+            self._error = exc
+            raise
+
+    async def _next(self) -> Union["MultipartReader", BodyPartReader] | None:
         await self._maybe_release_last_part()
         if self._at_bof:
             await self._read_until_first_boundary()
@@ -795,8 +952,7 @@ class MultipartReader:
         else:
             await self._read_boundary()
         if self._at_eof:  # we just read the last boundary, nothing to do there
-            # https://github.com/python/mypy/issues/17537
-            return None  # type: ignore[unreachable]
+            return None
 
         part = await self.fetch_next_part()
         # https://datatracker.ietf.org/doc/html/rfc7578#section-4.6
@@ -811,7 +967,7 @@ class MultipartReader:
                 # is 19 characters, so 32 should be more than enough for any valid encoding.
                 charset = await part.read_chunk(32)
                 if len(charset) > 31:
-                    raise RuntimeError("Invalid default charset")
+                    raise MultipartFormatError("Invalid default charset")
                 self._default_charset = charset.strip().decode()
                 part = await self.fetch_next_part()
         self._last_part = part
@@ -819,6 +975,7 @@ class MultipartReader:
 
     async def release(self) -> None:
         """Reads all the body parts to the void till the final boundary."""
+        self._raise_if_failed()
         while not self._at_eof:
             item = await self.next()
             if item is None:
@@ -829,6 +986,7 @@ class MultipartReader:
         self,
     ) -> Union["MultipartReader", BodyPartReader]:
         """Returns the next body part reader."""
+        self._budget.add_field()
         headers = await self._read_headers()
         return self._get_part_reader(headers)
 
@@ -846,8 +1004,10 @@ class MultipartReader:
         mimetype = parse_mimetype(ctype)
 
         if mimetype.type == "multipart":
+            if self._depth >= self._max_depth:
+                raise _limit_error(self._max_size_error_cls, self._max_depth, "depth")
             if self.multipart_reader_cls is None:
-                return type(self)(
+                reader: MultipartReader = type(self)(
                     headers,
                     self._content,
                     client_max_size=self._client_max_size,
@@ -855,16 +1015,24 @@ class MultipartReader:
                     max_headers=self._max_headers,
                     max_size_error_cls=self._max_size_error_cls,
                 )
-            return self.multipart_reader_cls(
-                headers,
-                self._content,
-                client_max_size=self._client_max_size,
-                max_field_size=self._max_field_size,
-                max_headers=self._max_headers,
-                max_size_error_cls=self._max_size_error_cls,
-            )
+            else:
+                reader = self.multipart_reader_cls(
+                    headers,
+                    self._content,
+                    client_max_size=self._client_max_size,
+                    max_field_size=self._max_field_size,
+                    max_headers=self._max_headers,
+                    max_size_error_cls=self._max_size_error_cls,
+                )
+            # Propagate the tree-wide limits and shared budget without
+            # requiring custom reader classes to grow new __init__ params.
+            reader._max_depth = self._max_depth
+            reader._max_part_size = self._max_part_size
+            reader._depth = self._depth + 1
+            reader._budget = self._budget
+            return reader
         else:
-            return self.part_reader_cls(
+            part = self.part_reader_cls(
                 self._boundary,
                 headers,
                 self._content,
@@ -873,11 +1041,16 @@ class MultipartReader:
                 client_max_size=self._client_max_size,
                 max_size_error_cls=self._max_size_error_cls,
             )
+            part._max_part_size = self._max_part_size
+            part._budget = self._budget
+            return part
 
     def _get_boundary(self) -> str:
         boundary = self._mimetype.parameters["boundary"]
         if len(boundary) > 70:
-            raise ValueError("boundary %r is too long (70 chars max)" % boundary)
+            raise MultipartFormatError(
+                "boundary %r is too long (70 chars max)" % boundary
+            )
 
         return boundary
 
@@ -890,7 +1063,9 @@ class MultipartReader:
         while True:
             chunk = await self._readline()
             if chunk == b"":
-                raise ValueError(f"Could not find starting boundary {self._boundary!r}")
+                raise MultipartFormatError(
+                    f"Could not find starting boundary {self._boundary!r}"
+                )
             chunk = chunk.rstrip()
             if chunk == self._boundary:
                 return
@@ -919,7 +1094,9 @@ class MultipartReader:
             else:
                 self._unread.extend([next_line, epilogue])
         else:
-            raise ValueError(f"Invalid boundary {chunk!r}, expected {self._boundary!r}")
+            raise MultipartFormatError(
+                f"Invalid boundary {chunk!r}, expected {self._boundary!r}"
+            )
 
     async def _read_headers(self) -> HeadersDictProxy:
         lines = []

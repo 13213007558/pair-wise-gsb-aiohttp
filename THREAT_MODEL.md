@@ -687,19 +687,30 @@ boundary at which user-supplied strings can become wire bytes.
 | # | Threat | Existing | Recommended |
 | :--- | :--- | :--- | :--- |
 | 4.1 | Boundary parameter | 70-char cap; missing-boundary raises; HTTP header layer ([§5.1](#51-http1-parser)) catches CR/LF/NUL. | None. |
-| 4.2 | Many small parts | `client_max_size` caps total bytes. `Request.post()` additionally caps the number of form fields at `client_max_fields` (default `1000`, `0` disables) since PR #13738: multipart parts are counted before each part is read, and urlencoded bodies are rejected by `yarl.query_to_pairs` before any pair is materialised. Both paths raise `HTTPRequestEntityTooLarge`. | The cap only covers `Request.post()`. Direct `MultipartReader` / `Request.multipart()` users still get an unbounded part count; a `max_parts` parameter on `MultipartReader` would close that path. **User**: operators sensitive to live-object count should reduce `client_max_fields` and `client_max_size`. |
-| 4.3 | Nested-multipart recursion | `Request.post()` rejects any nested multipart with `ValueError` ("To decode nested multipart you need to use custom reader") (`web_request.py:BaseRequest.post`). | **Direct `MultipartReader` users get unlimited recursion. Add a `max_nesting_depth` parameter (default e.g. 10) to fail cleanly before `RecursionError`.** |
+| 4.2 | Many small parts | `client_max_size` caps total bytes. `Request.post()` additionally caps the number of form fields at `client_max_fields` (default `1000`, `0` disables) since PR #13738: multipart parts are counted before each part is read, and urlencoded bodies are rejected by `yarl.query_to_pairs` before any pair is materialised. Both paths raise `HTTPRequestEntityTooLarge`. `MultipartReader` now also accepts `max_fields`, a tree-wide part counter shared with nested readers, so direct `MultipartReader` / `Request.multipart()` users can bound the part count too. | **User**: operators sensitive to live-object count should reduce `client_max_fields` and `client_max_size`, and set `max_fields` when driving `MultipartReader` directly. |
+| 4.3 | Nested-multipart recursion | `Request.post()` rejects any nested multipart with `ValueError` ("To decode nested multipart you need to use custom reader") (`web_request.py:BaseRequest.post`). `MultipartReader` now has a `max_depth` parameter (default `10`); the outermost body is depth 1 and a nested multipart reader beyond the limit raises the configured `max_size_error_cls` (default `MultipartLimitExceeded`) instead of recursing into `RecursionError`. | **User**: lower `max_depth` when the application never expects nested multipart. |
 | 4.4 | Per-part headers bounded | `max_field_size` / `max_headers` plumbed since 5fe9dfb64 (Mar 2026). | None. |
-| 4.5 | Per-part body bounded | Per-iteration size check since 9cc4b917c (Mar 2026). | None. |
+| 4.5 | Per-part body bounded | Per-iteration size check since 9cc4b917c (Mar 2026). The raw `client_max_size` check now lives in `BodyPartReader.read_chunk` itself, so `read()`, `readline()`, `release()` and the `next()` drain of an unconsumed part all enforce it — a skipped part can no longer be drained past the budget. Decoded output is additionally bounded per part (`max_part_size`) and across the whole body (`max_total_size`); both counters are shared by `read(decode=True)`, `decode()`, `decode_iter()`, `text()`, `json()` and `form()`. | None. |
 | 4.6 | Filename path traversal | None; verbatim return is the documented behaviour. | **User**: sanitise `BodyPartReader.filename` before opening / saving / reflecting (strip path components, control bytes, known-bad sequences). |
 | 4.7 | Field-name pass-through | None. | **User**: `request.post()` keys come from attacker-controlled `name` parameters; do not feed them directly to filesystem / DB / template paths. |
 | 4.8 | `_charset_` magic field | Behaviour follows the HTML5 spec for multipart form charset selection. | **Document the surprising behaviour: an attacker who can post any field can change how subsequent fields are decoded.** **User**: if your form-handling code makes decisions based on string content, be aware that the decode charset is attacker-influenceable. |
-| 4.9 | CTE decoding | `BodyPartReader._decode_content_transfer` dispatches to `base64.b64decode` / `binascii.a2b_qp` / pass-through for `binary`/`8bit`/`7bit`, and raises `RuntimeError` on any other token. Both decoders raise on malformed input; decoded output is still subject to the per-part `client_max_size` cap. For base64, `BodyPartReader.read_chunk` extends each chunk read until its base64-significant character count is a multiple of 4, so mid-quartet splits cannot silently corrupt the decoded output. | None. |
-| 4.10 | Content-Encoding decompression | Per-chunk `max_decompress_size`, per-part `client_max_size` cap. | Inherits the [§5.5](#55-compression-codecs) caveat about backend `max_length` honouring. |
+| 4.9 | CTE decoding | `BodyPartReader._decode_content_transfer` dispatches to `base64.b64decode` / `binascii.a2b_qp` / pass-through for `binary`/`8bit`/`7bit`, and raises `MultipartFormatError` (a `ValueError`) on any other token or on malformed base64, so format problems are distinguishable from budget excess (`MultipartLimitExceeded` / `max_size_error_cls`) and from client disconnects (the original stream error propagates unwrapped). Decoded output is subject to the per-part `client_max_size` cap and to the `max_part_size` / `max_total_size` decoded budgets. For base64, `BodyPartReader.read_chunk` extends each chunk read until its base64-significant character count is a multiple of 4, so mid-quartet splits cannot silently corrupt the decoded output. Because CTE decoding happens after the raw part has been consumed, a decoding failure leaves the stream positioned at the next boundary: the reader can still advance to the next part. | None. |
+| 4.10 | Content-Encoding decompression | Per-chunk `max_decompress_size`, per-part `client_max_size` cap, plus the `max_part_size` / `max_total_size` decoded budgets which are checked per decompressed chunk inside `decode_iter()`, so a zip bomb is cut off mid-stream instead of after full expansion. | Inherits the [§5.5](#55-compression-codecs) caveat about backend `max_length` honouring. |
 | 4.11 | Outbound boundary collision | UUID4-hex default; HMAC-grade entropy means collision with random body bytes is statistically negligible. | **User**: callers supplying their own boundary must use a random, sufficiently long value. |
 | 4.12 | `FormData` argument injection | `add_field` runs `name`, `filename`, and `content_type` through `_safe_header` (`http_writer.py:_safe_header`), rejecting `\r` / `\n` / `\x00`. `name` / `filename` are additionally percent-encoded by `content_disposition_header` (`helpers.py:content_disposition_header`) when `quote_fields=True` (default), so the `add_field` check is what closes the `quote_fields=False` opt-out path. | None. |
 | 4.13 | Per-part header injection | `Payload._binary_headers` (`payload.py:_binary_headers`) now applies `_safe_header` to every name and value, raising `ValueError` if CR / LF / NUL is present before any byte reaches the wire. Covers all paths that mutate the headers dict (constructor, direct assignment, `set_content_disposition`). | None. |
 | 4.14 | Temp-file lifetime | `tempfile.TemporaryFile()` is unlinked at creation on POSIX; closing the FD (whether explicit or via GC) reclaims the disk. | **User**: explicitly close `FileField`s you don't intend to consume to release the temp file promptly under high load. |
+
+**Failure-state model.** After any read-side failure — malformed body,
+budget exceeded, cancellation, or client disconnect — the affected
+`MultipartReader` / `BodyPartReader` latches the exception and re-raises it
+on every further operation instead of parsing from an undefined stream
+position.  Content-decoding failures (`MultipartFormatError` from an unknown
+or malformed `Content-Transfer-Encoding`) are the exception: they are
+raised only after the raw part has been consumed, so the stream stays
+positioned at the next boundary and the reader can advance.  In both cases
+the underlying payload is either advanced to the next part or traceably
+closed, and draining never loads the whole body into memory.
 
 **Past advisories / hardening (recap).**
 
@@ -741,5 +752,15 @@ boundary at which user-supplied strings can become wire bytes.
 - **PR #13738** (3.14.4) — `Request.post()` caps the number of form fields
   at `client_max_fields` (default `1000`) for both multipart and
   urlencoded bodies (threat 4.2).
+- **Multipart reader budgets** — `MultipartReader` gained `max_depth`
+  (default `10`, threat 4.3), `max_fields`, `max_part_size` and
+  `max_total_size` (threats 4.2, 4.5, 4.10); the raw `client_max_size`
+  check moved into `BodyPartReader.read_chunk` so `release()` and the
+  `next()` drain cannot bypass it (threat 4.5).  Reader errors are now
+  classified: `MultipartFormatError` for malformed bodies,
+  `MultipartLimitExceeded` (the new default `max_size_error_cls`, still a
+  `ValueError`) for budget excess, and unwrapped stream errors for client
+  disconnects; read-side failures are latched so a failed reader cannot be
+  re-parsed from an undefined stream position.
 
 These are all currently in place; this section assumes no regression.
