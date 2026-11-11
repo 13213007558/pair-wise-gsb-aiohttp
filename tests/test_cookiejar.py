@@ -2824,6 +2824,226 @@ def test_save_load_json_preserves_expires_deadline(tmp_path: Path) -> None:
     assert "sid" in jar_load.filter_cookies(url)
 
 
+def test_persistence_send_scope_survives_save_reload(tmp_path: Path) -> None:
+    """Same-named parent-domain, host-only and path-scoped cookies keep their
+    exact send targets after the clock advances across a save/load round-trip."""
+    file_path = tmp_path / "scope.json"
+    with freeze_time("2030-01-01"):
+        saved = CookieJar()
+        saved.update_cookies_from_headers(
+            [
+                "token=parent; Domain=example.com; Path=/",
+                "token=host",
+                "token=api; Path=/api",
+            ],
+            URL("https://www.example.com/login"),
+        )
+        saved.save(file_path)
+
+    with freeze_time("2030-01-02"):
+        jar = CookieJar()
+        jar.load(file_path)
+
+        def sent_value(url: str) -> str | None:
+            filtered = jar.filter_cookies(URL(url))
+            return filtered["token"].value if "token" in filtered else None
+
+        # The host-only cookie wins on its own host, including non-matching paths.
+        assert sent_value("https://www.example.com/") == "host"
+        assert sent_value("https://www.example.com/other") == "host"
+        # The more specific path-scoped cookie wins under /api.
+        assert sent_value("https://www.example.com/api/users") == "api"
+        # Only the parent-domain cookie leaves the host that issued the others.
+        assert sent_value("https://sub.example.com/") == "parent"
+        assert sent_value("https://sub.example.com/api/users") == "parent"
+        # Host-only cookies never follow a request to a sibling subdomain.
+        assert sent_value("https://other.www.example.com/") == "parent"
+        assert sent_value("https://unrelated.example.org/") is None
+
+
+def test_persistence_max_age_deadline_is_absolute_not_renewed(tmp_path: Path) -> None:
+    """A restored Max-Age cookie expires at its original absolute deadline;
+    reloading must not reschedule it from the load time."""
+    file_path = tmp_path / "deadline.json"
+    url = URL("https://example.com/")
+    with freeze_time("2030-01-01") as freezer:
+        saved = CookieJar()
+        saved.update_cookies_from_headers(
+            ["sid=x; Max-Age=3600", "session=persistent"], url
+        )
+        saved.save(file_path)
+
+        # Halfway through the original lifetime: both cookies still send.
+        freezer.tick(1800)
+        jar = CookieJar()
+        jar.load(file_path)
+        assert set(jar.filter_cookies(url)) == {"session", "sid"}
+
+        # Past the original deadline: renewal at load time would keep sid alive.
+        freezer.tick(1801)
+        assert set(jar.filter_cookies(url)) == {"session"}
+
+        # A fresh load after the deadline drops the cookie during load itself.
+        late_jar = CookieJar()
+        late_jar.load(file_path)
+        assert set(late_jar.filter_cookies(url)) == {"session"}
+
+
+def test_persistence_session_cookie_does_not_gain_expiry_on_reload(
+    tmp_path: Path,
+) -> None:
+    """A cookie without Max-Age/Expires stays a session cookie after reload."""
+    file_path = tmp_path / "session.json"
+    url = URL("https://example.com/")
+    with freeze_time("2030-01-01"):
+        saved = CookieJar()
+        saved.update_cookies_from_headers(["sid=x"], url)
+        saved.save(file_path)
+
+    with freeze_time("2031-01-01"):
+        jar = CookieJar()
+        jar.load(file_path)
+
+        assert not jar._expirations
+        assert jar.filter_cookies(url)["sid"].value == "x"
+
+
+@pytest.mark.parametrize(
+    "data",
+    (
+        {
+            "example.com|/": {
+                "a": _saved_cookie("a"),
+                "b": _saved_cookie("b", expires_timestamp="nan"),
+                "c": _saved_cookie("c"),
+            }
+        },
+        {
+            "example.com|/": {
+                "a": _saved_cookie("a"),
+                "b": {"value": "x", "coded_value": "x"},
+                "c": _saved_cookie("c"),
+            }
+        },
+        {
+            "example.com|/": {"a": _saved_cookie("a")},
+            "nopipe": {"b": _saved_cookie("b")},
+        },
+    ),
+    ids=("invalid-expiration", "missing-identity-key", "unparseable-bucket-key"),
+)
+def test_persistence_corrupt_record_mid_file_aborts_atomically(
+    tmp_path: Path, data: dict[str, dict[str, dict[str, object]]]
+) -> None:
+    """A bad record between good ones raises and leaves pre-existing cookies
+    in place instead of partially replacing the jar."""
+    file_path = _write_saved(tmp_path, data)
+    jar = CookieJar()
+    preexisting_url = URL("https://other.example/")
+    jar.update_cookies({"preexisting": "keep"}, preexisting_url)
+
+    with pytest.raises((ValueError, KeyError)):
+        jar.load(file_path)
+
+    assert [cookie.key for cookie in jar] == ["preexisting"]
+    assert jar.filter_cookies(preexisting_url)["preexisting"].value == "keep"
+
+
+def test_persistence_unacceptable_record_mid_file_skips_only_that_record(
+    tmp_path: Path,
+) -> None:
+    """Records the acceptance rules reject are dropped without losing neighbors."""
+    data = {
+        "example.com|/": {
+            "a": _saved_cookie("a"),
+            "cross-domain": _saved_cookie(
+                "cross-domain", domain="attacker.example"
+            ),
+            "c": _saved_cookie("c"),
+        },
+        "127.0.0.1|/": {"ip": _saved_cookie("ip", domain="127.0.0.1")},
+    }
+    file_path = _write_saved(tmp_path, data)
+    jar = CookieJar()
+
+    jar.load(file_path)
+
+    assert {cookie.key for cookie in jar} == {"a", "c"}
+    assert set(jar.filter_cookies(URL("https://example.com/"))) == {"a", "c"}
+    assert not jar.filter_cookies(URL("https://attacker.example/"))
+    assert not jar.filter_cookies(URL("http://127.0.0.1/"))
+
+
+@pytest.mark.parametrize(
+    ("host_only_last", "leaks_to_subdomain"),
+    ((False, True), (True, False)),
+    ids=("last-record-domain-wide", "last-record-host-only"),
+)
+def test_persistence_duplicate_identity_keeps_last_record_scope(
+    tmp_path: Path, host_only_last: bool, leaks_to_subdomain: bool
+) -> None:
+    """Two records normalizing to the same (domain, path, name) collapse to one
+    cookie whose scope is the last record's, never a merge that widens it."""
+    domain_wide = _saved_cookie(
+        "sid", "wide", domain="www.example.com", path="/"
+    )
+    host_only = _saved_cookie(
+        "sid", "narrow", domain="www.example.com", path="/", host_only=True
+    )
+    first, last = (
+        (host_only, domain_wide) if not host_only_last else (domain_wide, host_only)
+    )
+    data = {
+        "www.example.com|": {"sid": first},
+        "www.example.com|/": {"sid": last},
+    }
+    file_path = _write_saved(tmp_path, data)
+    jar = CookieJar()
+
+    jar.load(file_path)
+
+    assert len(jar) == 1
+    owner = URL("https://www.example.com/")
+    sibling = URL("https://sub.www.example.com/")
+    assert jar.filter_cookies(owner)["sid"].value == (
+        "narrow" if host_only_last else "wide"
+    )
+    assert ("sid" in jar.filter_cookies(sibling)) is leaks_to_subdomain
+
+
+def test_persistence_duplicate_identity_expiry_replacement_is_not_merged(
+    tmp_path: Path,
+) -> None:
+    """Duplicate identities follow replacement semantics, including deletions."""
+    live = _saved_cookie("sid", "live", expires_timestamp=4102444800.0)
+    deleted = _saved_cookie("sid", "gone", expires_timestamp=0.0)
+    url = URL("https://example.com/")
+
+    file_path = _write_saved(
+        tmp_path,
+        {
+            "example.com|/": {"sid": live},
+            "example.com|/other": {"sid": deleted},
+        },
+    )
+    jar = CookieJar()
+    jar.load(file_path)
+    assert len(jar) == 0
+    assert "sid" not in jar.filter_cookies(url)
+
+    reversed_path = _write_saved(
+        tmp_path,
+        {
+            "example.com|/other": {"sid": deleted},
+            "example.com|/": {"sid": live},
+        },
+    )
+    reversed_jar = CookieJar()
+    reversed_jar.load(reversed_path)
+    assert len(reversed_jar) == 1
+    assert reversed_jar.filter_cookies(url)["sid"].value == "live"
+
+
 def test_load_json_old_format_without_new_keys(tmp_path: Path) -> None:
     """Verify a file written by an older version (no host_only/expires_timestamp) loads."""
     file_path = tmp_path / "old.json"
