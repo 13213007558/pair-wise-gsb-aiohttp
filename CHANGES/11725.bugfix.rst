@@ -1,0 +1,5 @@
+Stopped a compressed WebSocket message whose background compression was
+still running from being written after the close frame: the writer now marks
+itself closing, cancels and drains any in-flight sender tasks before sending
+the close frame, and re-checks the closing state once the send lock is
+acquired -- by :user:`webknjaz`.

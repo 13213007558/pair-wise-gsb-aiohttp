@@ -87,6 +87,12 @@ class WebSocketWriter:
             # This prevents small frames from interleaving with large frames that
             # compress in the executor, avoiding compressor state corruption.
             async with self._send_lock:
+                # Re-check after acquiring the lock: close() may have set the
+                # closing flag while this send was waiting for the lock.
+                if self._closing:
+                    raise ClientConnectionResetError(
+                        "Cannot write to closing transport"
+                    )
                 self._send_compressed_frame_sync(message, opcode, compress)
         else:
             # Large compressed frames need shield to prevent corruption
@@ -238,6 +244,12 @@ class WebSocketWriter:
         advanced but data not sent, corrupting subsequent frames.
         """
         async with self._send_lock:
+            # Re-check after acquiring the lock: close() may have cancelled
+            # the queued send tasks and set the closing flag while this task
+            # was waiting for the lock. Writing here would emit a data frame
+            # after the close frame.
+            if self._closing:
+                raise ClientConnectionResetError("Cannot write to closing transport")
             # RSV are the reserved bits in the frame header. They are used to
             # indicate that the frame is using an extension.
             # https://datatracker.ietf.org/doc/html/rfc6455#section-5.2
@@ -261,9 +273,20 @@ class WebSocketWriter:
         """Close the websocket, sending the specified code and message."""
         if isinstance(message, str):
             message = message.encode("utf-8")
-        try:
-            await self.send_frame(
-                PACK_CLOSE_CODE(code) + message, opcode=WSMsgType.CLOSE
-            )
-        finally:
-            self._closing = True
+        # Mark the writer as closing first so no send that is still queued
+        # behind the lock can write a data frame once close() is in progress.
+        self._closing = True
+        # Large frames compress in shielded background tasks. The shield only
+        # protects them from their callers' cancellation; a task whose
+        # compression finishes after this point would otherwise still write a
+        # data frame behind the close frame. Cancel those tasks and wait for
+        # them to settle so the close frame is the last frame on the wire and
+        # no sender task outlives the connection.
+        if self._background_tasks:
+            background_tasks = set(self._background_tasks)
+            for task in background_tasks:
+                task.cancel()
+            await asyncio.gather(*background_tasks, return_exceptions=True)
+        await self.send_frame(
+            PACK_CLOSE_CODE(code) + message, opcode=WSMsgType.CLOSE
+        )
